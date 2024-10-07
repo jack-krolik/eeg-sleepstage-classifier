@@ -43,7 +43,6 @@ class ImprovedSleepDetectorCNN(nn.Module):
         self.dropout = nn.Dropout(0.5)
         self.output = nn.Linear(n_filters[-1], n_classes)
 
-    # ... rest of the class remains the same
     def forward(self, x):
         x_list = []
         for i in range(4):
@@ -110,6 +109,12 @@ class ImprovedSleepdetector(nn.Module):
         # self.med_target = torch.tensor([0.0257, 0.0942, 0.02157, 0.1055])
 
     def forward(self, x, spectral_features):
+        # print(f"Input shape: {x.shape}, Spectral features shape: {spectral_features.shape}")
+        assert x.dim() == 3, f"Expected input dim 3, got {x.dim()}"
+        assert x.shape[1] == 4, f"Expected 4 channels, got {x.shape[1]}"
+        assert spectral_features.shape[1] == 16, f"Expected 16 spectral features, got {spectral_features.shape[1]}"
+
+
         # Ensure the input is squeezed correctly if needed
         if x.shape[-1] == 1:
             x = x.squeeze(-1)
@@ -124,17 +129,15 @@ class ImprovedSleepdetector(nn.Module):
         for i in range(4):
             x[:, i] = med_target[:, i] + (x[:, i] - med_target[:, i]) * (iqr_target[:, i] / (q75[:, i] - q25[:, i] + 1e-8))
 
-        # Proceed with the CNN forward pass
+        # print(f"Input range: {x.min().item()} to {x.max().item()}")
         x_cnn = self.cnn(x)
-
-        # Combine CNN output with spectral features
+        # print(f"CNN output range: {x_cnn.min().item()} to {x_cnn.max().item()}")
         combined_features = torch.cat([x_cnn, spectral_features], dim=1)
         combined_features = F.relu(self.combine_features(combined_features))
-
-        # LSTM forward pass
-        x_lstm = combined_features.unsqueeze(1)  # Add sequence dimension
+        # print(f"Combined features range: {combined_features.min().item()} to {combined_features.max().item()}")
+        x_lstm = combined_features.unsqueeze(1)
         y_lstm = self.lstm(x_lstm)
-
+        # print(f"LSTM output range: {y_lstm.min().item()} to {y_lstm.max().item()}")
         return y_lstm
 
 

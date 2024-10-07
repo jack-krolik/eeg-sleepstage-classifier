@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import logging
 
 class ImprovedFeatureExtractor(nn.Module):
     def __init__(self, input_size=3000):
@@ -39,13 +38,12 @@ class ImprovedSleepDetectorCNN(nn.Module):
             self.conv_blocks.append(nn.Sequential(*layers))
         
         self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(n_filters[-1] * 4 * 47, 512)
-        self.bn1 = nn.BatchNorm1d(512)
+        self.fc1 = nn.Linear(n_filters[-1] * 4 * 47, 512)  # Updated input size
         self.fc2 = nn.Linear(512, n_filters[-1])
-        self.bn2 = nn.BatchNorm1d(n_filters[-1])
         self.dropout = nn.Dropout(0.5)
         self.output = nn.Linear(n_filters[-1], n_classes)
 
+    # ... rest of the class remains the same
     def forward(self, x):
         x_list = []
         for i in range(4):
@@ -55,49 +53,21 @@ class ImprovedSleepDetectorCNN(nn.Module):
         
         x = torch.cat(x_list, dim=1)
         x = self.flatten(x)
-        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.fc1(x))
         x = self.dropout(x)
-        x = F.relu(self.bn2(self.fc2(x)))
-        return x
+        x = F.relu(self.fc2(x))
+        return x  # This should now be of shape (batch_size, n_filters[-1])
 
-# class ImprovedSleepDetectorCNN(nn.Module):
-#     def __init__(self, n_filters=[32, 64, 128], kernel_size=[50, 25, 12], n_classes=5):
-#         super(ImprovedSleepDetectorCNN, self).__init__()
-#         self.conv_blocks = nn.ModuleList()
-        
-#         for i in range(4):  # 4 input signals
-#             layers = []
-#             in_channels = 1
-#             for j, (filters, kernel) in enumerate(zip(n_filters, kernel_size)):
-#                 layers.extend([
-#                     nn.Conv1d(in_channels, filters, kernel_size=kernel, stride=1, padding=kernel//2),
-#                     nn.BatchNorm1d(filters),
-#                     nn.ReLU(),
-#                     nn.MaxPool1d(kernel_size=4, stride=4)
-#                 ])
-#                 in_channels = filters
-#             self.conv_blocks.append(nn.Sequential(*layers))
-        
-#         self.flatten = nn.Flatten()
-#         self.fc1 = nn.Linear(n_filters[-1] * 4 * 47, 512)  # Updated input size
-#         self.fc2 = nn.Linear(512, n_filters[-1])
-#         self.dropout = nn.Dropout(0.5)
-#         self.output = nn.Linear(n_filters[-1], n_classes)
 
-#     def forward(self, x):
-#         x_list = []
-#         for i in range(4):
-#             x_i = x[:, i:i+1]
-#             x_i = self.conv_blocks[i](x_i)
-#             x_list.append(x_i)
-        
-#         x = torch.cat(x_list, dim=1)
-#         x = self.flatten(x)
-#         x = F.relu(self.fc1(x))
-#         x = self.dropout(x)
-#         x = F.relu(self.fc2(x))
-#         return x  # This should now be of shape (batch_size, n_filters[-1])
+# class ImprovedAttentionLayer(nn.Module):
+#     def __init__(self, hidden_size):
+#         super(ImprovedAttentionLayer, self).__init__()
+#         self.attention = nn.Linear(hidden_size * 2, 1)
 
+#     def forward(self, lstm_output):
+#         attention_weights = F.softmax(self.attention(lstm_output), dim=1)
+#         context_vector = torch.sum(attention_weights * lstm_output, dim=1)
+#         return context_vector, attention_weights
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_size, num_heads):
@@ -115,6 +85,7 @@ class MultiHeadAttention(nn.Module):
             attention_outputs.append(context_vector)
         return torch.cat(attention_outputs, dim=1)
 
+# Update ImprovedSleepDetectorLSTM to use MultiHeadAttention
 
 class ImprovedSleepDetectorLSTM(nn.Module):
     def __init__(self, input_size=1029, hidden_size=256, n_layers=2, n_classes=5, num_heads=4, dropout=0.5):
@@ -185,31 +156,28 @@ class ImprovedSleepdetector(nn.Module):
             x = x.squeeze(-1)
         
         # print(f"Shape after squeeze: {x.shape}")
-        epsilon = 1e-8
+        
         for i in range(4):
             x[:, i] = self.med_target[i] + (x[:, i] - x[:, i].median(dim=-1, keepdim=True).values) * \
-                  (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True) + epsilon))
-    
+                      (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True)))
         
         # print(f"Shape after normalization: {x.shape}")
         
         x_cnn = self.cnn(x)
-        if not torch.isfinite(x_cnn).all():
-            logging.error(f"Non-finite values detected after CNN: {x_cnn}")
-            x_cnn = torch.nan_to_num(x_cnn, nan=0.0, posinf=1e6, neginf=-1e6)
-
+        # print(f"Shape after CNN: {x_cnn.shape}")
+        
+        # Combine CNN output with spectral features
         combined_features = torch.cat([x_cnn, spectral_features], dim=1)
+        # print(f"Shape after combining CNN and spectral features: {combined_features.shape}")
         combined_features = F.relu(self.combine_features(combined_features))
-        if not torch.isfinite(combined_features).all():
-            logging.error(f"Non-finite values detected after combining features: {combined_features}")
-            combined_features = torch.nan_to_num(combined_features, nan=0.0, posinf=1e6, neginf=-1e6)
-
-        x_lstm = combined_features.unsqueeze(1)
+        # print(f"Shape after linear combination: {combined_features.shape}")
+        
+        # LSTM forward pass
+        x_lstm = combined_features.unsqueeze(1)  # Add sequence dimension
+        # print(f"Shape before LSTM: {x_lstm.shape}")
         y_lstm = self.lstm(x_lstm)
-        if not torch.isfinite(y_lstm).all():
-            logging.error(f"Non-finite values detected after LSTM: {y_lstm}")
-            y_lstm = torch.nan_to_num(y_lstm, nan=0.0, posinf=1e6, neginf=-1e6)
-
+        # print(f"Shape after LSTM: {y_lstm.shape}")
+        
         return y_lstm
 
     def predict(self, x):

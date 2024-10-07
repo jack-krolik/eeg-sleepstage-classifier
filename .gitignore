@@ -6,3 +6,5 @@ models/
 *.edf
 *.psg
 *.mat
+*.pt
+*.pth
