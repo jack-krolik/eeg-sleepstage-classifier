@@ -149,50 +149,54 @@ class ImprovedSleepdetector(nn.Module):
         self.iqr_target = torch.tensor([7.90, 11.37, 7.92, 11.56])
         self.med_target = torch.tensor([0.0257, 0.0942, 0.02157, 0.1055])
 
+
     # def forward(self, x, spectral_features):
-    #     # Ensure the input is squeezed correctly if needed
+    #     # print(f"Input shape: {x.shape}, Spectral features shape: {spectral_features.shape}")
+        
     #     if x.shape[-1] == 1:
     #         x = x.squeeze(-1)
-
-    #     # Calculate the median and interquartile range (IQR) for each channel dynamically
-    #     med_target = x.median(dim=-1, keepdim=True).values  # Calculate median along the last dimension
-    #     q75 = x.quantile(0.75, dim=-1, keepdim=True)  # 75th percentile (Q3)
-    #     q25 = x.quantile(0.25, dim=-1, keepdim=True)  # 25th percentile (Q1)
-    #     iqr_target = q75 - q25  # Interquartile range (IQR)
-
-    #     # Normalize each channel using its respective median and IQR
+        
+    #     # print(f"Shape after squeeze: {x.shape}")
+    #     epsilon = 1e-8
     #     for i in range(4):
-    #         x[:, i] = med_target[:, i] + (x[:, i] - med_target[:, i]) * (iqr_target[:, i] / (q75[:, i] - q25[:, i] + 1e-8))
-
-    #     # Proceed with the CNN forward pass
+    #         x[:, i] = self.med_target[i] + (x[:, i] - x[:, i].median(dim=-1, keepdim=True).values) * \
+    #               (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True) + epsilon))
+    
+        
+    #     # print(f"Shape after normalization: {x.shape}")
+        
     #     x_cnn = self.cnn(x)
+    #     if not torch.isfinite(x_cnn).all():
+    #         logging.error(f"Non-finite values detected after CNN: {x_cnn}")
+    #         x_cnn = torch.nan_to_num(x_cnn, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    #     # Combine CNN output with spectral features
     #     combined_features = torch.cat([x_cnn, spectral_features], dim=1)
     #     combined_features = F.relu(self.combine_features(combined_features))
+    #     if not torch.isfinite(combined_features).all():
+    #         logging.error(f"Non-finite values detected after combining features: {combined_features}")
+    #         combined_features = torch.nan_to_num(combined_features, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    #     # LSTM forward pass
-    #     x_lstm = combined_features.unsqueeze(1)  # Add sequence dimension
+    #     x_lstm = combined_features.unsqueeze(1)
     #     y_lstm = self.lstm(x_lstm)
+    #     if not torch.isfinite(y_lstm).all():
+    #         logging.error(f"Non-finite values detected after LSTM: {y_lstm}")
+    #         y_lstm = torch.nan_to_num(y_lstm, nan=0.0, posinf=1e6, neginf=-1e6)
 
     #     return y_lstm
 
 
     def forward(self, x, spectral_features):
-        # print(f"Input shape: {x.shape}, Spectral features shape: {spectral_features.shape}")
-        
         if x.shape[-1] == 1:
             x = x.squeeze(-1)
         
-        # print(f"Shape after squeeze: {x.shape}")
         epsilon = 1e-8
         for i in range(4):
             x[:, i] = self.med_target[i] + (x[:, i] - x[:, i].median(dim=-1, keepdim=True).values) * \
-                  (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True) + epsilon))
-    
-        
-        # print(f"Shape after normalization: {x.shape}")
-        
+                (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True) + epsilon))
+
+        # Normalize spectral features
+        spectral_features = (spectral_features - spectral_features.mean(dim=0, keepdim=True)) / (spectral_features.std(dim=0, keepdim=True) + epsilon)
+
         x_cnn = self.cnn(x)
         if not torch.isfinite(x_cnn).all():
             logging.error(f"Non-finite values detected after CNN: {x_cnn}")
