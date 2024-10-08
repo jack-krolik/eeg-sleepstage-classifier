@@ -1,3 +1,4 @@
+# %%
 from functions import *
 from classes import *
 from utils import *
@@ -10,10 +11,11 @@ import seaborn as sns
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-device = get_device(force_cpu=True)
+device = get_device()
 
 set_seed()
 
+# %%
 # Ensure the model save directory exists
 ensure_dir(CONFIG['model_path'])
 
@@ -72,7 +74,7 @@ if best_model_state is not None:
 
     # Evaluate on test set
     ensemble_model.load_state_dict(best_model_state)
-    test_accuracy, test_predictions = evaluate_model(ensemble_model, (X_test, X_test_spectral, y_test), device)
+    test_accuracy, test_predictions = evaluate_model(ensemble_model, (X_test, X_test_spectral, y_test), criterion, device)
     logging.info(f"Ensemble Model - Final Test Accuracy: {test_accuracy:.4f}")
 
     # Generate and save confusion matrix
@@ -88,6 +90,9 @@ if best_model_state is not None:
     report = classification_report(y_test.cpu().numpy(), test_predictions.cpu().numpy())
     logging.info(f"Classification Report:\n{report}")
 
+
+
+# %%
 # Train diverse ensemble
 diverse_ensemble = DiverseEnsembleModel(CONFIG['initial_params']['model_params']).to(device)
 diverse_optimizer = optim.AdamW(diverse_ensemble.parameters(), lr=best_lr, weight_decay=1e-2)
@@ -119,3 +124,8 @@ logging.info(f"Training completed.")
 logging.info(f"Ensemble Model - Final Test Accuracy: {ensemble_accuracy:.4f}")
 logging.info(f"Diverse Ensemble Model - Final Test Accuracy: {diverse_accuracy:.4f}")
 logging.info(f"Distilled Model - Final Test Accuracy: {distilled_accuracy:.4f}")
+
+# %%
+
+
+

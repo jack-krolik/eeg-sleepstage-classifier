@@ -17,9 +17,10 @@ import torch.nn as nn
 from classes import EnsembleModel, DiverseEnsembleModel
 from config import CONFIG, get_device
 import random
+import math
 
 
-device = get_device(force_cpu=True)
+device = get_device()
 
 # Set random seed for reproducibility
 def set_seed(seed=42):
@@ -366,7 +367,7 @@ def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
 
         # Validation loop
         model.eval()
-        val_loss, val_accuracy = evaluate_model(model, val_data, criterion, device)
+        val_loss, val_accuracy, _ = evaluate_model(model, val_data, criterion, device)
         
         # Step the scheduler with the validation loss
         scheduler.step(val_loss)
@@ -395,23 +396,28 @@ def evaluate_model(model, data, criterion, device):
     total_loss = 0
     correct = 0
     total = 0
+    all_predictions = []
+    
     with torch.no_grad():
         outputs = model(X.to(device), X_spectral.to(device))
         loss = criterion(outputs, y.to(device))
         total_loss += loss.item()
         _, predicted = torch.max(outputs, 1)
+        all_predictions.extend(predicted.cpu().numpy())
         total += y.size(0)
         correct += (predicted == y.to(device)).sum().item()
     
     accuracy = correct / total
     avg_loss = total_loss / total
-    return avg_loss, accuracy
+    return avg_loss, accuracy, np.array(all_predictions)
 
 def distill_knowledge(teacher_model, student_model, train_loader, val_data, device, num_epochs=50, log_interval=5):
     optimizer = optim.AdamW(student_model.parameters(), lr=1e-5, weight_decay=1e-2)
     scheduler = get_scheduler(optimizer, num_warmup_steps=len(train_loader) * 5, num_training_steps=len(train_loader) * num_epochs)
-    criterion = nn.KLDivLoss(reduction='batchmean')
-    temperature = 2.0  # Make sure this value is reasonable
+    ce_criterion = nn.CrossEntropyLoss()
+    kl_criterion = nn.KLDivLoss(reduction='batchmean')
+    temperature = 2.0
+    alpha = 0.5  # Balance between hard and soft targets
 
     teacher_model.eval()
     overall_progress = tqdm(total=num_epochs, desc="Overall Distillation Progress", position=0)
@@ -424,27 +430,23 @@ def distill_knowledge(teacher_model, student_model, train_loader, val_data, devi
         for batch_x, batch_x_spectral, batch_y in epoch_progress:
             batch_x, batch_x_spectral, batch_y = batch_x.to(device), batch_x_spectral.to(device), batch_y.to(device)
 
-            # Check for NaNs or Infs in input data
-            if torch.isnan(batch_x).any() or torch.isinf(batch_x).any():
-                print("NaNs or Infs detected in input data!")
-            
-            if torch.isnan(batch_x_spectral).any() or torch.isinf(batch_x_spectral).any():
-                print("NaNs or Infs detected in spectral input data!")
-
-            
             with torch.no_grad():
                 teacher_outputs = teacher_model(batch_x, batch_x_spectral)
             
             student_outputs = student_model(batch_x, batch_x_spectral)
             
-
-            epsilon = 1e-8  # Small constant to prevent log(0)
-            loss = criterion(
-                F.log_softmax(student_outputs / temperature + epsilon, dim=1),
-                F.softmax(teacher_outputs / temperature + epsilon, dim=1)
-            )
-
+            # Soft targets
+            soft_loss = kl_criterion(
+                F.log_softmax(student_outputs / temperature, dim=1),
+                F.softmax(teacher_outputs / temperature, dim=1)
+            ) * (temperature ** 2)
             
+            # Hard targets
+            hard_loss = ce_criterion(student_outputs, batch_y)
+            
+            # Combined loss
+            loss = alpha * hard_loss + (1 - alpha) * soft_loss
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -456,7 +458,7 @@ def distill_knowledge(teacher_model, student_model, train_loader, val_data, devi
         
         # Evaluate and log every log_interval epochs
         if (epoch + 1) % log_interval == 0 or epoch == num_epochs - 1:
-            accuracy = evaluate_model(student_model, val_data, device)
+            _, accuracy, _ = evaluate_model(student_model, val_data, ce_criterion, device)
             logging.info(f"Distillation Epoch {epoch+1}/{num_epochs} - Loss: {running_loss/len(train_loader):.4f}, Accuracy: {accuracy:.4f}, LR: {optimizer.param_groups[0]['lr']:.2e}")
         
         overall_progress.update(1)
