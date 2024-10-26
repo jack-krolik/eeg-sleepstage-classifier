@@ -4,7 +4,7 @@ import sys
 import logging
 from tools.config2 import CONFIG, device, cuda_manager  # Import the device directly from config
 import torch
-from tools.functions2 import set_seed
+from old_code.functions2 import set_seed
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ["NUMEXPR_MAX_THREADS"] = "16" 
@@ -20,8 +20,8 @@ logger.info(f"Using device: {device}")
 set_seed(CONFIG['settings']['seed'])
 
 # Import the rest of your modules
-from tools.functions2 import *
-from tools.classes2 import *
+from old_code.functions2 import *
+from old_code.classes2 import *
 from tools.utils2 import *
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
