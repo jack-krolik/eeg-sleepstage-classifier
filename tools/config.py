@@ -114,8 +114,10 @@ device = cuda_manager.device
 
 CONFIG = {
     'data_paths': [
-        os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_201_N1.mat'),
-        os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_201_N2.mat')
+        # os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_201_N1.mat'),
+        # os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_201_N2.mat'),
+        os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_202_N1.mat'),
+        os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_202_N2.mat'),
     ],
     'model_dir': os.path.join(BASE_DIR, 'models', 'new4'),
     'old_model_path': os.path.join(BASE_DIR, 'models', 'old'),

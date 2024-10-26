@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from optuna.samplers import TPESampler
 from sklearn.model_selection import KFold
 from torch.utils.data import WeightedRandomSampler
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
 
 
 
@@ -46,30 +47,6 @@ def set_seed(seed=42):
             print(f"Failed to set CUDA seed: {e}")
     else:
         print("CUDA not available, seed set only for CPU")
-
-# def load_data(data_path):
-#     try:
-#         mat_file = sio.loadmat(data_path)
-        
-#         x = np.stack((mat_file['sig1'], mat_file['sig2'], mat_file['sig3'], mat_file['sig4']), axis=1)
-#         x = torch.from_numpy(x).float()
-        
-#         y = torch.from_numpy(mat_file['labels'].flatten()).long()
-        
-#         valid_indices = y != -1
-#         x = x[valid_indices]
-#         y = y[valid_indices]
-        
-#         if x.dim() == 2:
-#             x = x.unsqueeze(1)
-        
-#         print(f"Loaded data shape: {x.shape}, Labels shape: {y.shape}")
-        
-#         return x, y
-
-#     except Exception as e:
-#         logging.error(f"Error loading data from {data_path}: {e}")
-#         raise
 
 def load_data(data_paths):
     """
@@ -308,13 +285,6 @@ def initialize_model_with_gpu_check(model_params, device):
         return model, device
 
 
-# def create_data_loaders(X, X_spectral, y, batch_size, is_train=True):
-#     dataset = TensorDataset(X, X_spectral, y)
-#     if is_train:
-#         sampler = BalancedBatchSampler(y.numpy(), batch_size=batch_size)
-#         return DataLoader(dataset, batch_sampler=sampler)
-#     else:
-#         return DataLoader(dataset, batch_size=batch_size, shuffle=False)
 def create_data_loaders(X, X_spectral, y, batch_size, is_train=True):
     dataset = TensorDataset(X, X_spectral, y)
     
@@ -363,8 +333,6 @@ def extract_spectral_features(x):
 
 
 
-
-
 def time_warp(x, sigma=0.2, knot=4):
     orig_steps = np.arange(x.shape[1])
     random_warps = np.random.normal(loc=1.0, scale=sigma, size=(x.shape[0], knot+2, x.shape[2]))
@@ -376,8 +344,6 @@ def time_warp(x, sigma=0.2, knot=4):
             scale = (x.shape[1]-1)/time_warp[-1]
             ret[i, :, dim] = np.interp(orig_steps, np.clip(scale*time_warp, 0, x.shape[1]-1), pat[:, dim]).T
     return ret
-
-
 
 
 def augment_minority_classes(x, x_spectral, y, minority_classes):
@@ -497,68 +463,6 @@ def improved_oversample(X, X_spectral, y, max_ratio=3.0, min_samples=50):
     return (torch.cat(oversampled_X), 
             torch.cat(oversampled_X_spectral), 
             torch.tensor(oversampled_y))
-
-    
-
-# def prepare_data(x, y, test_size=0.2, val_size=0.1):
-#     # Convert PyTorch tensors to NumPy arrays for scikit-learn
-#     x_np = x.cpu().numpy()
-#     y_np = y.cpu().numpy()
-
-#     # First split: separate test set
-#     X_train_val, X_test, y_train_val, y_test = train_test_split(
-#         x_np, y_np, 
-#         test_size=test_size, 
-#         stratify=y_np, 
-#         random_state=42
-#     )
-    
-#     # Second split: separate validation set
-#     X_train, X_val, y_train, y_val = train_test_split(
-#         X_train_val, 
-#         y_train_val, 
-#         test_size=val_size/(1-test_size), 
-#         stratify=y_train_val, 
-#         random_state=42
-#     )
-    
-#     # Convert back to PyTorch tensors for feature extraction
-#     X_train_torch = torch.from_numpy(X_train).float()
-#     X_val_torch = torch.from_numpy(X_val).float()
-#     X_test_torch = torch.from_numpy(X_test).float()
-
-#     # Extract spectral features
-#     X_train_spectral = np.array([extract_spectral_features(x) for x in X_train_torch])
-#     X_val_spectral = np.array([extract_spectral_features(x) for x in X_val_torch])
-#     X_test_spectral = np.array([extract_spectral_features(x) for x in X_test_torch])
-    
-#     print("Original train set class distribution:")
-#     print(Counter(y_train))
-    
-#     # Apply improved oversampling
-#     X_train_resampled, X_train_spectral_resampled, y_resampled = improved_oversample(
-#         torch.from_numpy(X_train).float(),
-#         torch.from_numpy(X_train_spectral).float(),
-#         y_train,
-#         max_ratio=3.0,  # Adjust this based on your needs
-#         min_samples=50  # Adjust this based on your needs
-#     )
-    
-#     print("After improved oversampling train set class distribution:")
-#     print(Counter(y_resampled.numpy()))
-    
-#     # Convert everything to PyTorch tensors
-#     return (X_train_resampled, 
-#             X_train_spectral_resampled, 
-#             torch.tensor(y_resampled), 
-#             # y_resampled.clone().detach(),
-#             torch.from_numpy(X_val).float(),
-#             torch.from_numpy(X_val_spectral).float(), 
-#             torch.from_numpy(y_val).long(),
-#             torch.from_numpy(X_test).float(),
-#             torch.from_numpy(X_test_spectral).float(), 
-#             torch.from_numpy(y_test).long())
-
 
 
 def get_scheduler(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
@@ -732,11 +636,6 @@ def find_lr(model, train_loader, val_loader, optimizer, criterion, device, num_i
             plt.close()
 
 
-# def get_class_weights(y):
-#     class_counts = torch.bincount(y)
-#     class_weights = 1. / class_counts.float()
-#     class_weights = class_weights / class_weights.sum()
-#     return class_weights
 def get_class_weights(y):
     class_counts = torch.bincount(y)
     class_weights = 1. / class_counts.float()
@@ -744,13 +643,6 @@ def get_class_weights(y):
     class_weights = torch.sqrt(class_weights)
     class_weights = class_weights / class_weights.sum()
     return class_weights
-
-
-
-
-
-
-
 
 
 def objective(trial, X, X_spectral, y, device, n_folds=5, start_with_config=False):
@@ -1045,107 +937,6 @@ def plot_training_history(metrics_history):
     plt.tight_layout()
     plt.savefig(os.path.join(CONFIG['model_dir'], 'training_history.png'))
     plt.close()
-
-# def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
-#                 device, epochs=100, accumulation_steps=4, verbose=True):
-#     scaler = GradScaler()
-#     early_stopping = EarlyStopping(
-#         patience=CONFIG['train_params']['initial']['early_stopping']['patience'],
-#         min_epochs=CONFIG['train_params']['initial']['early_stopping']['min_epochs'],
-#         min_delta=CONFIG['train_params']['initial']['early_stopping']['min_delta'],
-#         monitor=CONFIG['train_params']['initial']['early_stopping']['monitor'],
-#         mode='auto'
-#     )
-    
-#     metrics_history = {
-#         'train_loss': [],
-#         'val_loss': [],
-#         'val_accuracy': []
-#     }
-    
-#     for epoch in tqdm(range(epochs), desc="Training Progress"):
-#         # Training phase
-#         model.train()
-#         running_loss = 0.0
-#         for batch_idx, (batch_x, batch_x_spectral, batch_y) in enumerate(train_loader):
-#             try:
-#                 batch_x = batch_x.to(device)
-#                 batch_x_spectral = batch_x_spectral.to(device)
-#                 batch_y = batch_y.to(device)
-                
-#                 # Perform mixed precision training with autocast
-#                 with autocast(device_type=device.type if device.type != 'cpu' else 'cpu'):
-#                     outputs = model(batch_x, batch_x_spectral)
-#                     loss = criterion(outputs, batch_y)
-#                     loss = loss / accumulation_steps
-                
-#                 if device.type == 'cpu':
-#                     loss.backward()
-#                     if (batch_idx + 1) % accumulation_steps == 0:
-#                         optimizer.step()
-#                         optimizer.zero_grad()
-#                 else:
-#                     scaler.scale(loss).backward()
-#                     if (batch_idx + 1) % accumulation_steps == 0:
-#                         scaler.unscale_(optimizer)
-#                         optimizer.step()
-#                         scaler.update()
-#                         optimizer.zero_grad()
-
-#                 running_loss += loss.item() * accumulation_steps
-                
-#                 # ** Add this memory check every 50 batches **
-#                 if device.type == 'cuda' and batch_idx % 50 == 0:
-#                     allocated_memory = torch.cuda.memory_allocated(device) / 1e6
-#                     logging.info(f"Allocated GPU memory after {batch_idx} batches: {allocated_memory} MB")
-
-#             except RuntimeError as e:
-#                 if "CUDA" in str(e):
-#                     logging.error(f"CUDA error during training: {str(e)}")
-#                     device = torch.device('cpu')
-#                     model = model.cpu()
-#                     batch_x = batch_x.cpu()
-#                     batch_x_spectral = batch_x_spectral.cpu()
-#                     batch_y = batch_y.cpu()
-#                     continue
-#                 else:
-#                     raise e
-
-#         # Validation phase
-#         model.eval()
-#         val_loss, val_accuracy, _ = evaluate_model(model, val_data, criterion, device)
-        
-#         # Update learning rate
-#         scheduler.step(val_loss)
-        
-#         # Store metrics
-#         metrics_history['train_loss'].append(running_loss/len(train_loader))
-#         metrics_history['val_loss'].append(val_loss)
-#         metrics_history['val_accuracy'].append(val_accuracy)
-        
-#         # Check early stopping
-#         should_stop = early_stopping(
-#             metrics={'loss': val_loss, 'accuracy': val_accuracy},
-#             epoch=epoch,
-#             state_dict=model.state_dict()
-#         )
-        
-#         if verbose:
-#             current_lr = optimizer.param_groups[0]['lr']
-#             print(f"Epoch {epoch+1}/{epochs} - "
-#                   f"Loss: {running_loss/len(train_loader):.4f}, "
-#                   f"Val Loss: {val_loss:.4f}, "
-#                   f"Val Accuracy: {val_accuracy:.4f}, "
-#                   f"LR: {current_lr:.6f}")
-        
-#         if should_stop:
-#             print(f"Early stopping triggered at epoch {epoch+1}")
-#             break
-            
-#     # Plot training history
-#     plot_training_history(metrics_history)
-    
-#     return early_stopping.best_state, metrics_history['val_accuracy'][early_stopping.best_epoch]
 
 def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
                 device, epochs=100, accumulation_steps=4, verbose=True):

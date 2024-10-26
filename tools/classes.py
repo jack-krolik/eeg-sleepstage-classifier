@@ -4,6 +4,14 @@ from typing import List, Dict, Optional
 from torch.utils.data import Sampler
 import numpy as np
 from sleepdetector_new import ImprovedSleepdetector
+from tools.utils import *
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+from IPython.display import display, HTML
+from sklearn.metrics import confusion_matrix, classification_report, f1_score
+from tools.config import CONFIG, device, cuda_manager
+
 
 class EnsembleModel(nn.Module):
     """Ensemble of sleep detection models"""
@@ -173,3 +181,163 @@ class EarlyStopping:
             self.stop = True
             
         return self.stop
+    
+
+
+class SleepStageEvaluator:
+    def __init__(self, model_dir=CONFIG['model_dir']):
+        self.model_dir = model_dir
+        self.device = device
+        # Map class indices to sleep stage names
+        self.class_mapping = {
+            0: 'N3 (Deep)',
+            1: 'N2 (Light)',
+            2: 'N1 (Light)',
+            3: 'REM',
+            4: 'Wake'
+        }
+        self.class_names = [self.class_mapping[i] for i in range(5)]
+        ensure_dir(os.path.join(model_dir, 'test_results'))
+        self.save_outputs = True
+        
+    def plot_confusion_matrices(self, y_true, y_pred, model_name):
+        """Plot both absolute and percentage confusion matrices side by side"""
+        # Calculate confusion matrices
+        cm_absolute = confusion_matrix(y_true, y_pred)
+        cm_percentage = (cm_absolute.astype('float') / 
+                        cm_absolute.sum(axis=1)[:, np.newaxis] * 100)
+        
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(24, 10))
+        
+        # Plot absolute confusion matrix
+        sns.heatmap(cm_absolute, annot=True, fmt='d', cmap='Blues', square=True,
+                   xticklabels=self.class_names, yticklabels=self.class_names, ax=ax1)
+        ax1.set_ylabel('True Sleep Stage')
+        ax1.set_xlabel('Predicted Sleep Stage')
+        ax1.set_title(f'{model_name}\nAbsolute Confusion Matrix')
+        plt.setp(ax1.get_xticklabels(), rotation=45, ha='right')
+        plt.setp(ax1.get_yticklabels(), rotation=45, ha='right')
+        
+        # Plot percentage confusion matrix
+        sns.heatmap(cm_percentage, annot=True, fmt='.1f', cmap='Blues', square=True,
+                   xticklabels=self.class_names, yticklabels=self.class_names, ax=ax2)
+        ax2.set_ylabel('True Sleep Stage')
+        ax2.set_xlabel('Predicted Sleep Stage')
+        ax2.set_title(f'{model_name}\nPercentage Confusion Matrix')
+        plt.setp(ax2.get_xticklabels(), rotation=45, ha='right')
+        plt.setp(ax2.get_yticklabels(), rotation=45, ha='right')
+        
+        plt.tight_layout()
+        
+        # Save plot
+        if self.save_outputs:
+            save_path = os.path.join(self.model_dir, 'test_results', f'{model_name}_confusion_matrices.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        # Display in notebook and save
+        display(plt.gcf())
+        plt.close()
+        
+        return cm_absolute, cm_percentage
+    
+        
+    def display_metrics(self, y_true, y_pred, model_name):
+        """Calculate and display comprehensive metrics"""
+        # Calculate overall metrics
+        accuracy = (y_pred == y_true).mean() * 100
+        f1_macro = f1_score(y_true, y_pred, average='macro') * 100
+        f1_weighted = f1_score(y_true, y_pred, average='weighted') * 100
+        
+        # Generate detailed classification report
+        report = classification_report(y_true, y_pred, 
+                                    target_names=self.class_names, 
+                                    output_dict=True)
+        
+        # Create DataFrame from report
+        metrics_df = pd.DataFrame(report)
+        
+        # Print overall metrics
+        print(f"\n{'-'*50}")
+        print(f"{model_name} Results:")
+        print(f"{'-'*50}")
+        print(f"Overall Accuracy: {accuracy:.1f}%")
+        print(f"Macro F1-Score: {f1_macro:.1f}%")
+        print(f"Weighted F1-Score: {f1_weighted:.1f}%")
+        
+        # Convert metrics to percentages (except support)
+        metrics_formatted = metrics_df.copy()
+        for col in metrics_formatted.columns:
+            if col != 'support':
+                metrics_formatted[col] = metrics_formatted[col] * 100
+        
+        # Create a more readable version of the metrics
+        display_metrics = pd.DataFrame(
+            index=pd.Index(['Precision', 'Recall', 'F1-Score', 'Support']),
+            columns=self.class_names + ['Macro Avg', 'Weighted Avg']
+        )
+        
+        # Fill in the class metrics
+        for class_name in self.class_names:
+            if class_name in metrics_formatted.columns:
+                display_metrics.loc['Precision', class_name] = metrics_formatted.loc['precision', class_name]
+                display_metrics.loc['Recall', class_name] = metrics_formatted.loc['recall', class_name]
+                display_metrics.loc['F1-Score', class_name] = metrics_formatted.loc['f1-score', class_name]
+                display_metrics.loc['Support', class_name] = metrics_formatted.loc['support', class_name]
+        
+        # Fill in the averages
+        for avg in ['macro avg', 'weighted avg']:
+            col_name = 'Macro Avg' if avg == 'macro avg' else 'Weighted Avg'
+            display_metrics.loc['Precision', col_name] = metrics_formatted.loc['precision', avg]
+            display_metrics.loc['Recall', col_name] = metrics_formatted.loc['recall', avg]
+            display_metrics.loc['F1-Score', col_name] = metrics_formatted.loc['f1-score', avg]
+            display_metrics.loc['Support', col_name] = metrics_formatted.loc['support', avg]
+        
+        # Create styled version for display
+        styled_metrics = display_metrics.style\
+            .format(lambda x: f'{x:.1f}%' if pd.notnull(x) and isinstance(x, (int, float)) and x != int(x) else f'{int(x)}' if pd.notnull(x) else '', na_rep='-')\
+            .background_gradient(cmap='RdYlGn', subset=pd.IndexSlice[['Precision', 'Recall', 'F1-Score'], :])\
+            .set_caption(f"{model_name} Detailed Metrics")
+        
+        # Display the styled metrics
+        display(styled_metrics)
+        
+        # Save metrics to CSV
+        if self.save_outputs:
+            display_metrics.to_csv(os.path.join(self.model_dir, 'test_results', f'{model_name}_metrics.csv'))
+        
+        return metrics_df
+    
+    def evaluate_model(self, model, X, X_spectral, y, model_name):
+        """Evaluate a single model with comprehensive metrics and visualizations"""
+        print(f"\nEvaluating {model_name}...")
+        model.eval()
+        
+        try:
+            with torch.no_grad():
+                # Generate predictions
+                X = X.to(self.device)
+                X_spectral = X_spectral.to(self.device)
+                outputs = model(X, X_spectral)
+                predictions = outputs.argmax(dim=1).cpu().numpy()
+                true_labels = y.cpu().numpy()
+                
+                # Plot confusion matrices
+                cm_absolute, cm_percentage = self.plot_confusion_matrices(
+                    true_labels, predictions, model_name
+                )
+                
+                # Display and save metrics
+                metrics_df = self.display_metrics(true_labels, predictions, model_name)
+                
+                return {
+                    'predictions': predictions,
+                    'true_labels': true_labels,
+                    'confusion_matrix_absolute': cm_absolute,
+                    'confusion_matrix_percentage': cm_percentage,
+                    'metrics': metrics_df
+                }
+                
+        except Exception as e:
+            print(f"Error in model evaluation: {str(e)}")
+            raise  # Add this to see the full error traceback

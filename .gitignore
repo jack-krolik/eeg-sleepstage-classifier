@@ -10,3 +10,4 @@ models/
 *.pth
 old/
 old_code/
+*.log
