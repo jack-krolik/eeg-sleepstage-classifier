@@ -2,9 +2,9 @@
 import os
 import sys
 import logging
-from tools.config import CONFIG, device, cuda_manager  # Import the device directly from config
+from tools.config2 import CONFIG, device, cuda_manager  # Import the device directly from config
 import torch
-from tools.functions import set_seed
+from tools.functions2 import set_seed
 
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 os.environ["NUMEXPR_MAX_THREADS"] = "16" 
@@ -20,9 +20,9 @@ logger.info(f"Using device: {device}")
 set_seed(CONFIG['settings']['seed'])
 
 # Import the rest of your modules
-from tools.functions import *
-from tools.classes import *
-from tools.utils import *
+from tools.functions2 import *
+from tools.classes2 import *
+from tools.utils2 import *
 from sklearn.metrics import confusion_matrix, classification_report
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -32,36 +32,31 @@ from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
 # Ensure the model directory exists
 ensure_dir(CONFIG['model_dir'])
 
-
 # Load Data
 try:
-    x, y, night_indices = load_data(CONFIG['data_paths'])
-    logging.info(f"Successfully loaded data from {len(CONFIG['data_paths'])} nights")
-    logging.info(f"Total samples: {len(y)}")
-    logging.info(f"Samples per night: {Counter(night_indices.numpy())}")
+    x, y = load_data(CONFIG['data_path'])
+    logging.info(f"Loaded data shape: {x.shape}, Labels shape: {y.shape}")
 except Exception as e:
     logging.error(f"Error loading data: {str(e)}")
     raise
 
-# Prepare the data using the multi-night version
-X_train, X_train_spectral, y_train, X_val, X_val_spectral, y_val, X_test, X_test_spectral, y_test = prepare_data_multi_night(x, y, night_indices)
-
-# Add after prepare_data call
-logging.info("\nFinal class distribution details:")
-train_dist = Counter(y_train.numpy())
-val_dist = Counter(y_val.numpy())
-test_dist = Counter(y_test.numpy())
-logging.info(f"Training set: {dict(train_dist)}")
-logging.info(f"Validation set: {dict(val_dist)}")
-logging.info(f"Test set: {dict(test_dist)}")
+# Prepare the data (includes SMOTE)
+X_train, X_train_spectral, y_train, X_val, X_val_spectral, y_val, X_test, X_test_spectral, y_test = prepare_data(x, y)
 
 # Apply preprocessing
 X_train, X_train_spectral = preprocess_data(X_train, X_train_spectral)
 X_val, X_val_spectral = preprocess_data(X_val, X_val_spectral)
 X_test, X_test_spectral = preprocess_data(X_test, X_test_spectral)
 
+# Identify minority classes for augmentation
+class_counts = Counter(y_train.numpy())
+minority_classes = [cls for cls, count in class_counts.items() 
+                   if count < len(y_train) / len(class_counts) * 0.5]
 
-# Hyperparameter tuning
+# Apply augmentation
+X_train, X_train_spectral, y_train = augment_minority_classes(
+    X_train, X_train_spectral, y_train, minority_classes)
+
 run_tuning = True
 start_with_config = True  # Set this to True to start with CONFIG parameters
 fine_tune_lr = True  # Set this to True if you want to fine-tune the learning rate

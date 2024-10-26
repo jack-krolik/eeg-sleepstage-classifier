@@ -8,3 +8,5 @@ models/
 *.mat
 *.pt
 *.pth
+old/
+old_code/
