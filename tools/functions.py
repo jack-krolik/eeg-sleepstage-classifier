@@ -4,7 +4,7 @@ import scipy.io as sio
 import logging
 from scipy.signal import welch
 from scipy.interpolate import CubicSpline
-from collections import Counter
+from collections import Counter, defaultdict
 from sklearn.model_selection import train_test_split
 from imblearn.over_sampling import SMOTE
 import matplotlib.pyplot as plt
@@ -14,12 +14,14 @@ from sklearn.metrics import accuracy_score
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn as nn
-from tools.classes import *
+from tools.classes import ( EnsembleModel, EarlyStopping, SleepStageLoss, TrainingMonitor, 
+EarlyStoppingWithClassMetrics, SleepStageEvaluator, DynamicBatchSampler )
 from tools.config import *
 from tools.utils import *
 import random
 import math
 import os
+import optuna
 from optuna import create_study, trial
 from optuna.samplers import TPESampler
 from torch.utils.data import DataLoader, TensorDataset
@@ -48,21 +50,120 @@ def set_seed(seed=42):
     else:
         print("CUDA not available, seed set only for CPU")
 
-def load_data(data_paths):
+
+# Add these helper functions at the beginning:
+
+def validate_dimensions(X, X_spectral, y):
+    """Validate input dimensions and consistency"""
+    if X.ndim not in [2, 3]:
+        raise ValueError(f"Expected X to have 2 or 3 dimensions, got {X.ndim}")
+    if X_spectral.ndim != 2:
+        raise ValueError(f"Expected X_spectral to have 2 dimensions, got {X_spectral.ndim}")
+    if len(X) != len(y) or len(X_spectral) != len(y):
+        raise ValueError("Length mismatch between X, X_spectral, and y")
+
+def ensure_3d(x, name="array"):
+    """Ensure array is 3D with shape (samples, channels, features)"""
+    if x.ndim == 2:
+        logging.info(f"Reshaping {name} from 2D to 3D")
+        return x.reshape(x.shape[0], 1, -1)
+    elif x.ndim == 3:
+        return x
+    else:
+        raise ValueError(f"Cannot convert {name} with {x.ndim} dimensions to 3D")
+
+# def load_data(data_paths, verbose=False):
+#     """
+#     Load and combine any number of nights of sleep data
+    
+#     Args:
+#         data_paths: List of paths to .mat files containing sleep data
+        
+#     Returns:
+#         tuple: Combined features, labels, and night indices
+#     """
+#     combined_x = []
+#     combined_y = []
+#     night_indices = []  # Track which night each sample comes from
+    
+#     for night_idx, data_path in enumerate(data_paths):
+#         try:
+#             mat_file = sio.loadmat(data_path)
+            
+#             # Stack the signals for current night
+#             x = np.stack((mat_file['sig1'], mat_file['sig2'], 
+#                          mat_file['sig3'], mat_file['sig4']), axis=1)
+#             x = torch.from_numpy(x).float()
+            
+#             # Get labels for current night
+#             y = torch.from_numpy(mat_file['labels'].flatten()).long()
+            
+#             # Filter valid indices
+#             valid_indices = y != -1
+#             x = x[valid_indices]
+#             y = y[valid_indices]
+            
+#             if x.dim() == 2:
+#                 x = x.unsqueeze(1)
+            
+#             # Add data from this night
+#             combined_x.append(x)
+#             combined_y.append(y)
+#             night_indices.extend([night_idx] * len(y))
+            
+#             if verbose:
+#                 logging.info(f"Loaded data from {data_path}")
+#                 logging.info(f"Night {night_idx + 1} data shape: {x.shape}, Labels shape: {y.shape}")
+#                 logging.info(f"Class distribution for night {night_idx + 1}:\n    {format_class_distribution(Counter(y.numpy()))}")
+        
+#         except OSError as e:
+#             logging.error(f"Error loading data from {data_path}: {e}")
+#             continue  # Skip this file and move on to the next
+#         except Exception as e:
+#             logging.error(f"Error loading data from {data_path}: {e}")
+#             raise
+    
+#     try:
+#         combined_x = torch.cat(combined_x, dim=0)
+#         combined_y = torch.cat(combined_y, dim=0)
+#         night_indices = torch.tensor(night_indices)
+        
+#         logging.info(f"Combined data shape: {combined_x.shape}")
+#         logging.info(f"Combined labels shape: {combined_y.shape}")
+#         logging.info(f"Overall class distribution:\n    {format_class_distribution(Counter(combined_y.numpy()))}")
+        
+#         return combined_x, combined_y, night_indices
+        
+#     except Exception as e:
+#         logging.error(f"Error combining data: {e}")
+#         raise
+
+def load_data(data_paths, verbose=False):
     """
-    Load and combine any number of nights of sleep data
+    Load and combine multiple nights of sleep data with variable lengths
     
     Args:
         data_paths: List of paths to .mat files containing sleep data
+        verbose: Whether to print detailed loading information
         
     Returns:
-        tuple: Combined features, labels, and night indices
+        tuple: (combined_x, combined_y, night_indices, night_lengths)
+            - combined_x: Tensor containing all EEG signals
+            - combined_y: Tensor containing all sleep stage labels
+            - night_indices: Tensor mapping each epoch to its night
+            - night_lengths: Dictionary mapping night indices to number of epochs
     """
     combined_x = []
     combined_y = []
-    night_indices = []  # Track which night each sample comes from
+    night_indices = []
+    night_lengths = {}
+    total_epochs = 0
+    valid_nights = 0
+    
+    logging.info(f"Loading data from {len(data_paths)} nights...")
     
     for night_idx, data_path in enumerate(data_paths):
+    # for night_idx, path in enumerate(tqdm(data_paths, desc="Loading files", disable=not verbose)):
         try:
             mat_file = sio.loadmat(data_path)
             
@@ -82,151 +183,477 @@ def load_data(data_paths):
             if x.dim() == 2:
                 x = x.unsqueeze(1)
             
+            # Record night length and update counters
+            n_epochs = len(y)
+            night_lengths[night_idx] = n_epochs
+            total_epochs += n_epochs
+            valid_nights += 1
+            
             # Add data from this night
             combined_x.append(x)
             combined_y.append(y)
-            night_indices.extend([night_idx] * len(y))
+            night_indices.extend([night_idx] * n_epochs)
+        
+        #     if not verbose:
+        #                 continue  # Skip detailed logging
+        # except Exception as e:
+        #     logging.error(f"Error loading {path}: {e}")
+        #     continue
             
-            logging.info(f"Loaded data from {data_path}")
-            logging.info(f"Night {night_idx + 1} data shape: {x.shape}, Labels shape: {y.shape}")
-            logging.info(f"Class distribution for night {night_idx + 1}: {Counter(y.numpy())}")
-            
+            if verbose:
+                logging.info(f"\nNight {night_idx + 1}:")
+                logging.info(f"    Source: {os.path.basename(data_path)}")
+                logging.info(f"    Epochs: {n_epochs}")
+                logging.info(f"    Data shape: {x.shape}")
+                logging.info(f"    Class distribution:\n        " + 
+                           format_class_distribution(Counter(y.numpy())).replace('\n', '\n        '))
+        
+        except OSError as e:
+            logging.error(f"Error loading data from {data_path}: {e}")
+            continue  # Skip this file and move on to the next
         except Exception as e:
             logging.error(f"Error loading data from {data_path}: {e}")
             raise
     
     try:
+        # Combine all data
         combined_x = torch.cat(combined_x, dim=0)
         combined_y = torch.cat(combined_y, dim=0)
         night_indices = torch.tensor(night_indices)
         
-        logging.info(f"Combined data shape: {combined_x.shape}")
-        logging.info(f"Combined labels shape: {combined_y.shape}")
-        logging.info(f"Overall class distribution: {Counter(combined_y.numpy())}")
+        # Calculate statistics
+        avg_epochs = total_epochs / valid_nights if valid_nights > 0 else 0
+        epoch_std = np.std([length for length in night_lengths.values()])
+        min_epochs = min(night_lengths.values())
+        max_epochs = max(night_lengths.values())
         
-        return combined_x, combined_y, night_indices
+        # Log overall statistics
+        logging.info("\nData Loading Summary:")
+        logging.info(f"    Total nights processed: {valid_nights}")
+        logging.info(f"    Total epochs: {total_epochs}")
+        logging.info(f"    Average epochs per night: {avg_epochs:.1f} ± {epoch_std:.1f}")
+        logging.info(f"    Range: {min_epochs} to {max_epochs} epochs")
+
+        if verbose:
+            logging.info("\nNight lengths (epochs):")
+            for night_idx, length in sorted(night_lengths.items()):
+                logging.info(f"    Night {night_idx + 1}: {length}")
+        
+        logging.info("\nOverall Data Shapes:")
+        logging.info(f"    Combined data: {combined_x.shape}")
+        logging.info(f"    Combined labels: {combined_y.shape}")
+        
+        logging.info("\nOverall Class Distribution:")
+        logging.info("    " + format_class_distribution(Counter(combined_y.numpy())).replace('\n', '\n    '))
+        
+        # Verify data integrity
+        if len(combined_y) != total_epochs:
+            raise ValueError(f"Mismatch in total epochs: {len(combined_y)} vs {total_epochs}")
+        if len(night_indices) != total_epochs:
+            raise ValueError(f"Mismatch in night indices: {len(night_indices)} vs {total_epochs}")
+        
+        
+        return combined_x, combined_y, night_indices, night_lengths
         
     except Exception as e:
         logging.error(f"Error combining data: {e}")
         raise
 
-def prepare_data_multi_night(x, y, night_indices, test_size=0.2, val_size=0.1):
+
+
+
+def calculate_segment_weights(segments, target_samples):
+    """Helper to calculate weights for segment distribution"""
+    weights = []
+    for segment in segments:
+        # Consider both segment length and target samples
+        segment_length = len(segment)
+        weight = segment_length / target_samples if target_samples > 0 else 0
+        weights.append(1 - weight)  # Inverse weight - prefer smaller segments for better distribution
+    return np.array(weights)
+
+def softmax(x):
+    """Compute softmax values for array x"""
+    e_x = np.exp(x - np.max(x))
+    return e_x / e_x.sum()
+
+def calculate_oversampling_targets(class_counts, strategy='proportional'):
     """
-    Prepare data for any number of nights with robust handling of rare classes
+    Calculate target counts for oversampling based on different strategies
     
     Args:
-        x: Combined input features from multiple nights
-        y: Combined labels from multiple nights
-        night_indices: Tensor indicating which night each sample belongs to
-        test_size: Proportion of data to use for testing
-        val_size: Proportion of training data to use for validation
-    """
-    # Convert to numpy for sklearn
-    x_np = x.cpu().numpy()
-    y_np = y.cpu().numpy()
-    night_indices_np = night_indices.cpu().numpy()
+        class_counts: Dictionary of current class counts
+        strategy: 'balanced' or 'proportional'
     
-    # Analyze class distribution
-    class_counts = Counter(y_np)
-    logging.info(f"Class distribution before split: {class_counts}")
+    Returns:
+        Dictionary of target counts per class
+    """
+    total_samples = sum(class_counts.values())
+    max_class_count = max(class_counts.values())
+    
+    if strategy == 'balanced':
+        # All classes will have the same count as the majority class
+        return {cls: max_class_count for cls in class_counts.keys()}
+    else:
+        # Maintain relative proportions while increasing minority classes
+        desired_total = total_samples * 1.5  # Increase total samples by 50%
+        class_ratios = {
+            cls: count / total_samples 
+            for cls, count in class_counts.items()
+        }
+        return {
+            cls: max(count, int(desired_total * ratio))
+            for cls, (count, ratio) in zip(
+                class_counts.keys(), 
+                class_ratios.items()
+            )
+        }
+
+def prepare_data_multi_night(x, y, night_indices, night_lengths, train_size=0.7, val_size=0.15, test_size=0.15):
+    """Enhanced data preparation with proper tensor and integer handling"""
+    # Validate split ratios
+    assert abs(train_size + val_size + test_size - 1.0) < 1e-6, "Split ratios must sum to 1.0"
+    
+    # Initial class distribution logging
+    initial_dist = Counter(y.numpy())
+    logging.info("\nInitial class distribution:")
+    for cls in sorted(initial_dist.keys()):
+        count = initial_dist[cls]
+        percentage = count / len(y) * 100
+        logging.info(f"    {SLEEP_STAGES[cls]}: {count} ({percentage:.1f}%)")
     
     try:
-        # First split: separate test set
-        # If some classes have too few samples, we'll fall back to night-based stratification only
-        if min(class_counts.values()) >= 5:
-            # Create composite stratification labels
-            stratify_labels = np.stack([night_indices_np, y_np], axis=1)
-            X_train_val, X_test, y_train_val, y_test, night_train_val, night_test = train_test_split(
-                x_np, y_np, night_indices_np,
-                test_size=test_size,
-                stratify=stratify_labels,
-                random_state=42
-            )
-        else:
-            logging.warning("Some classes have very few samples. Falling back to night-based stratification only.")
-            X_train_val, X_test, y_train_val, y_test, night_train_val, night_test = train_test_split(
-                x_np, y_np, night_indices_np,
-                test_size=test_size,
-                stratify=night_indices_np,
-                random_state=42
-            )
+        # Ensure all inputs are proper tensors
+        x = torch.as_tensor(x, dtype=torch.float32)
+        y = torch.as_tensor(y, dtype=torch.long)
+        night_indices = torch.as_tensor(night_indices, dtype=torch.long)
         
-        # Second split: separate validation set
-        # Again, check if we can stratify by both night and class
-        if min(Counter(y_train_val).values()) >= 5:
-            stratify_labels_train = np.stack([night_train_val, y_train_val], axis=1)
-            X_train, X_val, y_train, y_val, night_train, night_val = train_test_split(
-                X_train_val, y_train_val, night_train_val,
-                test_size=val_size/(1-test_size),
-                stratify=stratify_labels_train,
-                random_state=42
-            )
-        else:
-            logging.warning("Falling back to night-based stratification for validation split.")
-            X_train, X_val, y_train, y_val, night_train, night_val = train_test_split(
-                X_train_val, y_train_val, night_train_val,
-                test_size=val_size/(1-test_size),
-                stratify=night_train_val,
-                random_state=42
-            )
+        # Get unique nights as integers
+        unique_nights = night_indices.unique().cpu().numpy()
+        n_nights = len(unique_nights)
         
-        # Convert to PyTorch tensors
-        X_train_torch = torch.from_numpy(X_train).float()
-        X_val_torch = torch.from_numpy(X_val).float()
-        X_test_torch = torch.from_numpy(X_test).float()
+        # Calculate split sizes
+        n_train = int(n_nights * train_size)
+        n_val = int(n_nights * val_size)
         
+        # Build night distribution dictionary
+        night_class_dist = {}
+        for night in unique_nights:
+            night_mask = night_indices == night
+            night_class_dist[night] = Counter(y[night_mask].cpu().numpy())
+        
+        # Calculate distribution similarity
+        overall_dist = Counter(y.cpu().numpy())
+        total_samples = len(y)
+        
+        def get_dist_similarity(night):
+            night_dist = night_class_dist[night]
+            similarity = 0
+            for cls in overall_dist:
+                expected_prop = overall_dist[cls] / total_samples
+                night_prop = night_dist.get(cls, 0) / sum(night_dist.values())
+                similarity += abs(expected_prop - night_prop)
+            return similarity
+        
+        # Sort and shuffle nights
+        sorted_nights = sorted(unique_nights, key=get_dist_similarity)
+        np.random.shuffle(sorted_nights)  # In-place shuffle
+        
+        # Split nights
+        train_nights = set(sorted_nights[:n_train])
+        val_nights = set(sorted_nights[n_train:n_train+n_val])
+        test_nights = set(sorted_nights[n_train+n_val:])
+        
+        # Create boolean masks
+        train_mask = torch.tensor([n.item() in train_nights for n in night_indices])
+        val_mask = torch.tensor([n.item() in val_nights for n in night_indices])
+        test_mask = torch.tensor([n.item() in test_nights for n in night_indices])
+        
+        # Split data
+        X_train = x[train_mask]
+        y_train = y[train_mask]
+        X_val = x[val_mask]
+        y_val = y[val_mask]
+        X_test = x[test_mask]
+        y_test = y[test_mask]
+        
+        # Calculate target count for oversampling
+        train_class_counts = Counter(y_train.numpy())
+
+
+        
+        # Calculate targets that maintain relative proportions
+        target_counts = calculate_oversampling_targets(
+            train_class_counts,
+            strategy='proportional'  # or 'balanced' for equal class sizes
+        )
+
+        logging.info("\nClass distribution details:")
+        total_samples = sum(train_class_counts.values())
+        for cls in sorted(train_class_counts.keys()):
+            current = train_class_counts[cls]
+            target = target_counts[cls]
+            orig_ratio = current / total_samples
+            new_ratio = target / sum(target_counts.values())
+            
+            logging.info(f"    {SLEEP_STAGES[cls]}:")
+            logging.info(f"        Current: {current} ({orig_ratio:.1%})")
+            logging.info(f"        Target:  {target} ({new_ratio:.1%})")
+            logging.info(f"        Increase factor: {target/current:.2f}x")
+       
         # Extract spectral features
-        X_train_spectral = np.array([extract_spectral_features(x) for x in X_train_torch])
-        X_val_spectral = np.array([extract_spectral_features(x) for x in X_val_torch])
-        X_test_spectral = np.array([extract_spectral_features(x) for x in X_test_torch])
+        logging.info("\nExtracting spectral features...")
+        X_train_spectral = torch.tensor(extract_spectral_features_batch(X_train), dtype=torch.float32)
+        X_val_spectral = torch.tensor(extract_spectral_features_batch(X_val), dtype=torch.float32)
+        X_test_spectral = torch.tensor(extract_spectral_features_batch(X_test), dtype=torch.float32)
         
-        # Log split statistics
-        logging.info("\nData split statistics:")
-        logging.info(f"Training set shape: {X_train.shape}")
-        logging.info(f"Training set nights: {Counter(night_train)}")
-        logging.info(f"Training set classes: {Counter(y_train)}")
-        logging.info(f"Validation set shape: {X_val.shape}")
-        logging.info(f"Validation set nights: {Counter(night_val)}")
-        logging.info(f"Validation set classes: {Counter(y_val)}")
-        logging.info(f"Test set shape: {X_test.shape}")
-        logging.info(f"Test set nights: {Counter(night_test)}")
-        logging.info(f"Test set classes: {Counter(y_test)}")
-        
-        # Apply improved oversampling only to training set
-        X_train_resampled, X_train_spectral_resampled, y_resampled = improved_oversample(
-            torch.from_numpy(X_train).float(),
-            torch.from_numpy(X_train_spectral).float(),
-            y_train,
-            max_ratio=3.0,
-            min_samples=50
+        # Apply oversampling
+        logging.info("\nApplying oversampling to training data...")
+        X_train_resampled, X_train_spectral_resampled, y_train_resampled = improved_oversample(
+            X_train, X_train_spectral, y_train, target_count=None
         )
         
-        logging.info("\nAfter oversampling:")
-        logging.info(f"Training set classes: {Counter(y_resampled.numpy())}")
+        # Log final distributions
+        splits = {
+            "Training": (y_train_resampled, len(y_train_resampled)),
+            "Validation": (y_val, len(y_val)),
+            "Testing": (y_test, len(y_test))
+        }
         
-        return (X_train_resampled,
-                X_train_spectral_resampled,
-                y_resampled,
-                torch.from_numpy(X_val).float(),
-                torch.from_numpy(X_val_spectral).float(),
-                torch.from_numpy(y_val).long(),
-                torch.from_numpy(X_test).float(),
-                torch.from_numpy(X_test_spectral).float(),
-                torch.from_numpy(y_test).long())
-                
+        for name, (y_split, total) in splits.items():
+            dist = Counter(y_split.cpu().numpy())
+            logging.info(f"\n{name} split distribution:")
+            for cls in sorted(dist.keys()):
+                count = dist[cls]
+                percentage = count / total * 100
+                logging.info(f"    {SLEEP_STAGES[cls]}: {count} ({percentage:.1f}%)")
+        
+        return (
+            X_train_resampled, X_train_spectral_resampled, y_train_resampled,
+            X_val, X_val_spectral, y_val,
+            X_test, X_test_spectral, y_test
+        )
+        
     except Exception as e:
-        logging.error(f"Error in data preparation: {str(e)}")
+        logging.error(f"Error preparing data: {str(e)}")
         raise
 
+# def prepare_data_multi_night(x, y, night_indices, night_lengths, train_size=0.7, val_size=0.15, test_size=0.15):
+#     """
+#     Prepare data with balanced class distribution across splits while maintaining temporal relationships
+    
+#     Args:
+#         x: Input features tensor
+#         y: Labels tensor
+#         night_indices: Tensor indicating which night each sample belongs to
+#         night_lengths: Dictionary mapping night indices to number of epochs
+#         train_size: Proportion of data for training set
+#         val_size: Proportion of data for validation set
+#         test_size: Proportion of data for test set
+#     """
+#     if not math.isclose(train_size + val_size + test_size, 1.0, rel_tol=1e-9):
+#         raise ValueError(f"Split ratios must sum to 1.0 (got {train_size + val_size + test_size})")
+    
+#     x_np = x.cpu().numpy()
+#     y_np = y.cpu().numpy()
+#     night_indices_np = night_indices.cpu().numpy()
+    
+#     total_samples = len(y_np)
+#     class_counts = Counter(y_np)
+    
+#     # Verify all classes are present
+#     expected_classes = set(range(len(SLEEP_STAGES)))  # 0 to 4
+#     found_classes = set(class_counts.keys())
+#     if found_classes != expected_classes:
+#         logging.warning(f"Missing classes in data: {expected_classes - found_classes}")
+    
+#     logging.info(f"Class distribution before split:\n    {format_class_distribution(class_counts)}")
 
+#     try:
+#         unique_nights = np.unique(night_indices_np)
+        
+#         # Analyze class distribution per night
+#         night_class_stats = {}
+#         for night in unique_nights:
+#             night_mask = night_indices_np == night
+#             night_y = y_np[night_mask]
+#             night_class_stats[night] = Counter(night_y)
+            
+#             logging.info(f"\nNight {night} class distribution:")
+#             logging.info("    " + format_class_distribution(night_class_stats[night]))
+        
+#         # Identify rare classes (less than 1% of total samples)
+#         rare_class_threshold = total_samples * 0.01
+#         rare_classes = {cls: count for cls, count in class_counts.items() 
+#                        if count < rare_class_threshold}
+        
+#         if rare_classes:
+#             logging.info("\nIdentified rare classes:")
+#             for cls, count in rare_classes.items():
+#                 logging.info(f"    {SLEEP_STAGES[cls]}: {count} samples ({count/total_samples:.1%})")
+        
+#         # Initialize containers for class-wise segments
+#         class_segments = {cls: [] for cls in SLEEP_STAGES.keys()}
+        
+#         # Find continuous segments for each class
+#         for night in unique_nights:
+#             night_mask = night_indices_np == night
+#             night_indices_local = np.where(night_mask)[0]
+#             night_y = y_np[night_indices_local]
+            
+#             for class_label in SLEEP_STAGES.keys():
+#                 class_mask = night_y == class_label
+#                 if not np.any(class_mask):
+#                     continue
+                
+#                 # Find continuous segments
+#                 segment_starts = np.where(np.diff(np.concatenate(([0], class_mask))) == 1)[0]
+#                 segment_ends = np.where(np.diff(np.concatenate((class_mask, [0]))) == -1)[0]
+                
+#                 for start, end in zip(segment_starts, segment_ends):
+#                     segment = night_indices_local[start:end + 1]
+#                     min_length = 1 if class_label in rare_classes else 3
+#                     if len(segment) >= min_length:
+#                         class_segments[class_label].append(segment.tolist())
+        
+#         # Calculate target samples per class per split
+#         target_samples = {
+#             'train': {cls: max(int(count * train_size), 1) for cls, count in class_counts.items()},
+#             'val': {cls: max(int(count * val_size), 1) for cls, count in class_counts.items()},
+#             'test': {cls: max(int(count * test_size), 1) for cls, count in class_counts.items()}
+#         }
+        
+#         # Initialize split indices
+#         split_indices = {
+#             'train': [],
+#             'val': [],
+#             'test': []
+#         }
+        
+#         # Process each class
+#         for class_label in SLEEP_STAGES.keys():
+#             if not class_segments[class_label]:
+#                 logging.warning(f"No segments found for class {SLEEP_STAGES[class_label]}")
+#                 continue
+            
+#             segments = class_segments[class_label]
+#             np.random.shuffle(segments)  # Shuffle while keeping segments intact
+            
+#             # Ensure rare classes are represented in training
+#             # if class_label in rare_classes:
+#             #     # Allocate all segments to training
+#             #     split_indices['train'].extend([idx for segment in segments for idx in segment])
+#             if class_label in rare_classes:
+#                 # Distribute rare classes across all splits while maintaining temporal relationships
+#                 n_segments = len(segments)
+#                 train_end = int(n_segments * 0.8)  # Bias towards training
+#                 val_end = int(n_segments * 0.9)
+                
+#                 split_indices['train'].extend([idx for seg in segments[:train_end] for idx in seg])
+#                 split_indices['val'].extend([idx for seg in segments[train_end:val_end] for idx in seg])
+#                 split_indices['test'].extend([idx for seg in segments[val_end:] for idx in seg])
+#             else:
+#                 # Calculate split points
+#                 total_segments = len(segments)
+#                 n_train = max(int(total_segments * train_size), 1)
+#                 n_val = max(int(total_segments * val_size), 1)
+                
+#                 # Distribute segments
+#                 train_segments = segments[:n_train]
+#                 val_segments = segments[n_train:n_train + n_val]
+#                 test_segments = segments[n_train + n_val:]
+                
+#                 # Add to split indices
+#                 for segment in train_segments:
+#                     split_indices['train'].extend(segment)
+#                 for segment in val_segments:
+#                     split_indices['val'].extend(segment)
+#                 for segment in test_segments:
+#                     split_indices['test'].extend(segment)
+        
+#         # Convert to numpy arrays
+#         train_indices = np.array(split_indices['train'], dtype=np.int64)
+#         val_indices = np.array(split_indices['val'], dtype=np.int64)
+#         test_indices = np.array(split_indices['test'], dtype=np.int64)
+        
+#         # Handle empty splits
+#         if len(train_indices) == 0 or len(val_indices) == 0 or len(test_indices) == 0:
+#             logging.warning("Empty splits detected, redistributing samples")
+#             all_indices = np.concatenate([train_indices, val_indices, test_indices])
+#             np.random.shuffle(all_indices)
+            
+#             n_train = int(len(all_indices) * train_size)
+#             n_val = int(len(all_indices) * val_size)
+            
+#             train_indices = all_indices[:n_train]
+#             val_indices = all_indices[n_train:n_train + n_val]
+#             test_indices = all_indices[n_train + n_val:]
+        
+#         # Create final splits
+#         X_train = x_np[train_indices]
+#         y_train = y_np[train_indices]
+#         X_val = x_np[val_indices]
+#         y_val = y_np[val_indices]
+#         X_test = x_np[test_indices]
+#         y_test = y_np[test_indices]
+        
+#         # Validate class distribution in splits
+#         for split_name, y_split in [
+#             ('Training', y_train),
+#             ('Validation', y_val),
+#             ('Testing', y_test)
+#         ]:
+#             split_dist = Counter(y_split)
+#             missing_classes = set(range(len(SLEEP_STAGES))) - set(split_dist.keys())
+#             logging.info(f"\n{split_name} split distribution:")
+#             logging.info(f"    Samples: {len(y_split)} ({len(y_split)/total_samples:.1%})")
+#             logging.info("    " + format_class_distribution(split_dist))
+#             if missing_classes:
+#                 logging.warning(f"{split_name} split is missing classes: {missing_classes}")
+        
+#         # Extract spectral features
+#         X_train_spectral = np.array([extract_spectral_features(torch.from_numpy(x)) for x in X_train])
+#         X_val_spectral = np.array([extract_spectral_features(torch.from_numpy(x)) for x in X_val])
+#         X_test_spectral = np.array([extract_spectral_features(torch.from_numpy(x)) for x in X_test])
+        
+#         # Apply improved oversampling to training set
+#         X_train_resampled, X_train_spectral_resampled, y_resampled = improved_oversample(
+#             torch.from_numpy(X_train).float(),
+#             torch.from_numpy(X_train_spectral).float(),
+#             torch.from_numpy(y_train),
+#             max_ratio=3.0,
+#             min_samples=50
+#         )
+        
+#         return (X_train_resampled,
+#                 X_train_spectral_resampled,
+#                 y_resampled,
+#                 torch.from_numpy(X_val).float(),
+#                 torch.from_numpy(X_val_spectral).float(),
+#                 torch.from_numpy(y_val).long(),
+#                 torch.from_numpy(X_test).float(),
+#                 torch.from_numpy(X_test_spectral).float(),
+#                 torch.from_numpy(y_test).long())
+                
+#     except Exception as e:
+#         logging.error(f"Error in data preparation: {str(e)}")
+#         logging.error("Detailed error information:")
+#         import traceback
+#         traceback.print_exc()
+#         raise
 
 
 def preprocess_data(X, X_spectral):
-    # Remove outliers (e.g., clip values beyond 3 standard deviations)
-    X = torch.clamp(X, -3, 3)
+    """
+    Light preprocessing for already processed data
     
-    # Ensure X_spectral is non-negative (if it represents power spectral density)
-    X_spectral = torch.clamp(X_spectral, min=0)
+    Args:
+        X: Signal data that's already been through batch_preprocessing.py
+        X_spectral: Spectral features
+    """
+    # Just ensure data types and ranges are correct
+    X = torch.clamp(X, -5, 5)  # Conservative clipping since data is already scaled
+    X_spectral = torch.clamp(X_spectral, min=0)  # Spectral powers are non-negative
     
     return X, X_spectral
 
@@ -249,101 +676,344 @@ def generate_random_params():
 
 
 def initialize_model_with_gpu_check(model_params, device):
+    """
+    Initialize model with comprehensive GPU memory checking and fallback handling
+    
+    Args:
+        model_params: Dictionary of model parameters
+        device: Target device for model
+        
+    Returns:
+        tuple: (initialized model, device to use)
+    """
     try:
         if device.type == 'cuda':
-            # Check memory availability before model initialization
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()  # Clear the cache before measuring memory
-                total_memory = torch.cuda.get_device_properties(device).total_memory
-                allocated_memory = torch.cuda.memory_allocated()
-                free_memory = total_memory - allocated_memory
+            # Clear GPU cache and log initial memory state
+            torch.cuda.empty_cache()
+            initial_memory = torch.cuda.memory_allocated(device)
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            
+            logging.info(f"\nInitializing model on {device}:")
+            logging.info(f"    Available memory: {(total_memory - initial_memory)/1e9:.2f}GB")
+            
+            # Estimate model size
+            temp_model = EnsembleModel(model_params)
+            model_size = sum(p.numel() * p.element_size() for p in temp_model.parameters())
+            estimated_memory = model_size * 3  # Account for optimizer and gradients
+            
+            logging.info(f"    Estimated model memory: {model_size/1e9:.2f}GB")
+            logging.info(f"    Estimated total usage: {estimated_memory/1e9:.2f}GB")
+            
+            if estimated_memory > (total_memory - initial_memory) * 0.9:  # 90% threshold
+                logging.warning("Insufficient GPU memory for safe model initialization")
+                device = torch.device('cpu')
+                logging.info("Falling back to CPU")
+            
+            del temp_model
+            torch.cuda.empty_cache()
+        
+        # Initialize model with proper error handling
+        try:
+            model = EnsembleModel(model_params).to(device)
+            
+            # Initialize weights
+            model.apply(model._init_weights)
+            
+            # Verify model initialization
+            try:
+                with torch.no_grad():
+                    # Test forward pass with small batch
+                    test_input = torch.randn(2, 4, 3000).to(device)
+                    test_spectral = torch.randn(2, 16).to(device)
+                    _ = model(test_input, test_spectral)
+                    
+                    if device.type == 'cuda':
+                        torch.cuda.synchronize()
+                        
+                logging.info("Model initialization successful")
+                    
+            except Exception as e:
+                logging.error(f"Model verification failed: {str(e)}")
+                raise
+            
+            return model, device
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logging.error("GPU OOM during model initialization")
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+                device = torch.device('cpu')
+                model = EnsembleModel(model_params).to(device)
+                model.apply(model._init_weights)
+                return model, device
+            raise
+            
+    except Exception as e:
+        logging.error(f"Error in model initialization: {str(e)}")
+        raise
 
-                # Log memory before initialization
-                logging.info(f"Free GPU memory before initialization: {free_memory / 1e6} MB")
-
-                estimated_size = sum(p.numel() * p.element_size() for p in EnsembleModel(model_params).parameters())
-
-                if estimated_size * 2 > free_memory:  # Less aggressive factor for safety
-                    logging.warning("Insufficient GPU memory, retrying with reduced batch size")
-                    raise MemoryError("GPU out of memory")
-
-        # Initialize model on device
-        model = EnsembleModel(model_params).to(device)
-        model.apply(model._init_weights)
-        return model, device
-
-    except MemoryError as e:
-        logging.error(f"MemoryError: {str(e)} - Trying to recover")
-        torch.cuda.empty_cache()  # Clear memory
-        return model.cpu(), torch.device('cpu')
-
-    except RuntimeError as e:
-        logging.error(f"RuntimeError: {str(e)}")
-        device = torch.device('cpu')
-        model = EnsembleModel(model_params).to(device)
-        model.apply(model._init_weights)
-        return model, device
-
-
-def create_data_loaders(X, X_spectral, y, batch_size, is_train=True):
-    dataset = TensorDataset(X, X_spectral, y)
+def verify_model_integrity(model, device):
+    """
+    Verify model integrity with comprehensive checks
     
-    if is_train:
-        # Calculate sample weights for balanced sampling
-        class_counts = torch.bincount(y)
-        class_weights = 1. / class_counts.float()
-        class_weights = torch.sqrt(class_weights)  # Reduce extreme weights
-        class_weights = class_weights / class_weights.sum()
+    Args:
+        model: The initialized model
+        device: Device the model is on
+    """
+    try:
+        model.eval()
+        with torch.no_grad():
+            # Test various input sizes
+            batch_sizes = [1, 2, 4]
+            for batch_size in batch_sizes:
+                test_input = torch.randn(batch_size, 4, 3000).to(device)
+                test_spectral = torch.randn(batch_size, 16).to(device)
+                outputs = model(test_input, test_spectral)
+                
+                # Verify output shape
+                expected_shape = (batch_size, len(SLEEP_STAGES))
+                assert outputs.shape == expected_shape, \
+                    f"Invalid output shape: {outputs.shape}, expected {expected_shape}"
+                
+                # Verify output values
+                assert not torch.isnan(outputs).any(), "Model produced NaN values"
+                assert not torch.isinf(outputs).any(), "Model produced infinite values"
+                
+                if device.type == 'cuda':
+                    torch.cuda.synchronize()
+                    
+        logging.info("Model integrity verification passed")
         
-        # Create sample weights
-        sample_weights = class_weights[y]
+    except Exception as e:
+        logging.error(f"Model integrity verification failed: {str(e)}")
+        raise
+
+def setup_training_components(model, train_loader, config):
+    """
+    Set up training components with proper initialization
+    
+    Args:
+        model: The initialized model
+        train_loader: Training data loader
+        config: Configuration dictionary
         
-        # Create weighted sampler
-        sampler = WeightedRandomSampler(
-            weights=sample_weights,
-            num_samples=len(y),
-            replacement=True
+    Returns:
+        tuple: (optimizer, scheduler, criterion)
+    """
+    try:
+        # Get class weights for loss function
+        labels = torch.tensor([y for _, _, y in train_loader.dataset])
+        class_weights = get_class_weights(labels).to(model.device)
+        
+        # Initialize criterion
+        criterion = nn.CrossEntropyLoss(
+            weight=class_weights + 1e-6,
+            label_smoothing=0.1
         )
         
-        return DataLoader(dataset, 
-                         batch_size=batch_size,
-                         sampler=sampler,
-                         num_workers=4,
-                         pin_memory=True)
-    else:
-        return DataLoader(dataset, 
-                         batch_size=batch_size,
-                         shuffle=False,
-                         num_workers=4,
-                         pin_memory=True)
+        # Initialize optimizer
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=config['train_params']['initial']['lr'],
+            weight_decay=1e-5,
+            eps=1e-8
+        )
+        
+        # Initialize scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=config['train_params']['scheduler']['factor'],
+            patience=config['train_params']['scheduler']['patience'],
+            min_lr=config['train_params']['scheduler']['min_lr'],
+            verbose=config['train_params']['scheduler']['verbose']
+        )
+        
+        return optimizer, scheduler, criterion
+        
+    except Exception as e:
+        logging.error(f"Error setting up training components: {str(e)}")
+        raise
 
 
 def extract_spectral_features(x):
+    """
+    Extract spectral features optimized for your preprocessed data
+    
+    Args:
+        x: Input signal of shape (channels, timepoints) that has been:
+           - Bandpass filtered (0.5-50 Hz)
+           - Downsampled to 100 Hz
+           - Bipolar referenced
+           - Artifact cleaned
+           - Scaled to target IQR and median
+    """
     features = []
-    for channel in range(x.shape[0]):  # Iterate over channels
-        # Convert to NumPy array for scipy.signal.welch
+    sample_rate = 100  # From your preprocessing
+    
+    # Define frequency bands matching your preprocessing
+    freq_bands = {
+        'delta': (0.5, 4),    # Lower bound matches your bandpass
+        'theta': (4, 8),
+        'alpha': (8, 13),
+        'beta': (13, 30),
+        'gamma': (30, 50)     # Upper bound matches your bandpass
+    }
+    
+    for channel in range(x.shape[0]):  # 4 bipolar channels
         channel_data = x[channel].cpu().numpy()
-        f, psd = welch(channel_data, fs=100, nperseg=min(1000, len(channel_data)))
-        delta = np.sum(psd[(f >= 0.5) & (f <= 4)])
-        theta = np.sum(psd[(f > 4) & (f <= 8)])
-        alpha = np.sum(psd[(f > 8) & (f <= 13)])
-        beta = np.sum(psd[(f > 13) & (f <= 30)])
-        features.extend([delta, theta, alpha, beta])
+        
+        # Use window length that matches your epoch duration
+        nperseg = min(3000, len(channel_data))  # 30s * 100Hz = 3000 samples
+        
+        # Compute PSD with parameters matching your preprocessing
+        f, psd = welch(channel_data, fs=sample_rate, 
+                      nperseg=nperseg,
+                      noverlap=nperseg//2)
+        
+        # Extract powers in your filtered bands
+        for band_name, (low, high) in freq_bands.items():
+            mask = (f >= low) & (f <= high)
+            if np.any(mask):
+                band_power = np.sum(psd[mask])
+                features.append(band_power)
+    
     return np.array(features)
+
+def extract_spectral_features_batch(X):
+    """
+    Batched version of spectral feature extraction
+    
+    Args:
+        X: Input data of shape (batch_size, channels, samples)
+        
+    Returns:
+        Array of spectral features for the batch
+    """
+    if isinstance(X, np.ndarray):  # Convert each sample to tensor if it’s numpy
+            X = torch.from_numpy(X)
+
+    batch_size = len(X)
+    features_list = []
+    
+    # Process in smaller batches to manage memory
+    batch_size_proc = 100  # Process 100 samples at a time
+    
+    
+    for i in range(0, batch_size, batch_size_proc):
+        
+        end_idx = min(i + batch_size_proc, batch_size)
+        batch = X[i:end_idx]
+        
+        # Process each sample in the mini-batch
+        batch_features = []
+        for sample in batch:
+            features = extract_spectral_features(sample)
+            batch_features.append(features)
+        
+        features_list.extend(batch_features)
+    
+    return np.array(features_list)
 
 
 
 def time_warp(x, sigma=0.2, knot=4):
-    orig_steps = np.arange(x.shape[1])
-    random_warps = np.random.normal(loc=1.0, scale=sigma, size=(x.shape[0], knot+2, x.shape[2]))
-    warp_steps = (np.ones((x.shape[2],1))*(np.linspace(0, x.shape[1]-1., num=knot+2))).T
+    """
+    Apply time warping to EEG signals while preserving signal characteristics
+    
+    Args:
+        x: Input signal of shape (batch_size, channels, samples) or (channels, samples)
+        sigma: Warping intensity (smaller values = less distortion)
+        knot: Number of control points for warping
+    
+    Returns:
+        Warped signal with same shape as input
+    """
+    # Convert input to numpy if it's a tensor
+    if torch.is_tensor(x):
+        is_tensor = True
+        x = x.cpu().numpy()
+    else:
+        is_tensor = False
+    
+    # Ensure input is 3D: (batch_size, channels, samples)
+    if x.ndim == 2:
+        x = x.reshape(1, *x.shape)
+    
+    batch_size, n_channels, n_samples = x.shape
     ret = np.zeros_like(x)
-    for i, pat in enumerate(x):
-        for dim in range(x.shape[2]):
-            time_warp = CubicSpline(warp_steps[:, dim], warp_steps[:, dim] * random_warps[i, :, dim])(orig_steps)
-            scale = (x.shape[1]-1)/time_warp[-1]
-            ret[i, :, dim] = np.interp(orig_steps, np.clip(scale*time_warp, 0, x.shape[1]-1), pat[:, dim]).T
-    return ret
+    
+    # Create base time steps
+    orig_steps = np.arange(n_samples, dtype=np.float32)
+    
+    try:
+        for i in range(batch_size):
+            for ch in range(n_channels):
+                # Generate knot points with better spacing
+                knot_points = np.linspace(0, n_samples - 1, num=knot + 2)
+                
+                # Generate smoother warping pattern
+                random_warps = np.random.normal(loc=1.0, scale=sigma, size=knot + 2)
+                random_warps = np.abs(random_warps)  # Ensure positive values
+                random_warps[0] = 1.0  # Fix endpoints
+                random_warps[-1] = 1.0
+                
+                # Apply smoothing to warps
+                random_warps = np.convolve(random_warps, [0.2, 0.6, 0.2], mode='same')
+                
+                # Create cumulative warps
+                random_warps = np.cumsum(random_warps)
+                random_warps = random_warps / random_warps[-1]
+                
+                # Generate warped knots
+                warped_knots = knot_points * random_warps
+                
+                # Ensure strict monotonicity
+                eps = 1e-6
+                for j in range(1, len(warped_knots)):
+                    if warped_knots[j] <= warped_knots[j-1]:
+                        warped_knots[j] = warped_knots[j-1] + eps
+                
+                try:
+                    # Create smoother interpolation
+                    warp_func = CubicSpline(
+                        knot_points, 
+                        warped_knots,
+                        bc_type='clamped'
+                    )
+                    
+                    # Generate warped time points
+                    time_warp = warp_func(orig_steps)
+                    time_warp = np.maximum.accumulate(time_warp)
+                    time_warp = time_warp * (n_samples - 1) / time_warp[-1]
+                    
+                    # Preserve signal characteristics
+                    channel_data = x[i, ch]
+                    warped_data = np.interp(
+                        orig_steps,
+                        np.clip(time_warp, 0, n_samples - 1),
+                        channel_data
+                    )
+                    
+                    # Normalize to maintain signal amplitude
+                    orig_std = np.std(channel_data)
+                    warped_std = np.std(warped_data)
+                    if warped_std > 0:
+                        warped_data = warped_data * (orig_std / warped_std)
+                    
+                    ret[i, ch] = warped_data
+                    
+                except ValueError as e:
+                    logging.warning(f"Interpolation failed: {str(e)}. Using original signal.")
+                    ret[i, ch] = x[i, ch]
+                    
+    except Exception as e:
+        logging.error(f"Time warping failed: {str(e)}")
+        return torch.from_numpy(x) if is_tensor else x
+    
+    # Return tensor if input was tensor
+    return torch.from_numpy(ret) if is_tensor else ret
 
 
 def augment_minority_classes(x, x_spectral, y, minority_classes):
@@ -356,113 +1026,213 @@ def augment_minority_classes(x, x_spectral, y, minority_classes):
         augmented_y.append(y[i])
         if y[i] in minority_classes:
             # Apply time_warp augmentation
-            augmented = torch.from_numpy(time_warp(x[i].unsqueeze(0).numpy(), sigma=0.3, knot=5)).squeeze(0)
+            augmented = time_warp(x[i].unsqueeze(0), sigma=0.3, knot=5).squeeze(0)
             augmented_x.append(augmented)
             augmented_x_spectral.append(x_spectral[i])  # Duplicate spectral features for augmented data
             augmented_y.append(y[i])
     return torch.stack(augmented_x), torch.stack(augmented_x_spectral), torch.tensor(augmented_y)
 
-
-def simple_oversample(X, X_spectral, y):
-    class_counts = Counter(y)
-    max_count = max(class_counts.values())
-    oversampled_X = []
-    oversampled_X_spectral = []
-    oversampled_y = []
-    
-    for class_label in class_counts:
-        class_indices = np.where(y == class_label)[0]
-        n_samples = len(class_indices)
-        n_oversample = max_count - n_samples
-        
-        oversampled_X.append(X[class_indices])
-        oversampled_X_spectral.append(X_spectral[class_indices])
-        oversampled_y.extend([class_label] * n_samples)
-        
-        if n_oversample > 0:
-            oversampled_indices = np.random.choice(class_indices, size=n_oversample, replace=True)
-            oversampled_X.append(X[oversampled_indices])
-            oversampled_X_spectral.append(X_spectral[oversampled_indices])
-            oversampled_y.extend([class_label] * n_oversample)
-    
-    return np.concatenate(oversampled_X), np.concatenate(oversampled_X_spectral), np.array(oversampled_y)
-
-
-def improved_oversample(X, X_spectral, y, max_ratio=3.0, min_samples=50):
+def compute_dynamic_importance_factors(class_counts):
     """
-    Improved oversampling with controlled ratios and augmentation
+    Compute class importance factors based on distribution
     
     Args:
-        X: Input features
-        X_spectral: Spectral features
-        y: Labels
-        max_ratio: Maximum ratio between largest and smallest class
-        min_samples: Minimum samples per class after oversampling
-    """
-    class_counts = Counter(y)
-    median_count = np.median(list(class_counts.values()))
-    target_counts = {}
-    
-    # Calculate target count for each class
-    for class_label, count in class_counts.items():
-        if count < median_count:
-            # Don't oversample minority classes too aggressively
-            target_count = min(
-                median_count,  # Don't exceed median
-                max(
-                    min_samples,  # Ensure minimum samples
-                    count * max_ratio  # Limit oversampling ratio
-                )
-            )
-        else:
-            target_count = count  # Don't modify majority classes
-        target_counts[class_label] = int(target_count)
-    
-    oversampled_X = []
-    oversampled_X_spectral = []
-    oversampled_y = []
-    
-    for class_label in class_counts:
-        class_indices = np.where(y == class_label)[0]
-        current_count = len(class_indices)
-        target_count = target_counts[class_label]
+        class_counts: Dictionary of class frequencies
         
-        # First add all original samples
-        oversampled_X.append(X[class_indices])
-        oversampled_X_spectral.append(X_spectral[class_indices])
-        oversampled_y.extend([class_label] * current_count)
+    Returns:
+        Dictionary of importance factors per class
+    """
+    total_samples = sum(class_counts.values())
+    class_ratios = {
+        cls: count/total_samples 
+        for cls, count in class_counts.items()
+    }
+    
+    # Compute relative scarcity
+    median_ratio = np.median(list(class_ratios.values()))
+    importance_factors = {
+        cls: np.log1p(median_ratio/ratio)
+        for cls, ratio in class_ratios.items()
+    }
+    
+    # Normalize factors
+    max_factor = max(importance_factors.values())
+    importance_factors = {
+        cls: factor/max_factor + 1.0
+        for cls, factor in importance_factors.items()
+    }
+    
+    return importance_factors
+
+
+
+def create_balanced_data_loaders(X, X_spectral, y, batch_size, is_train=True):
+    """
+    Create data loaders with balanced class sampling
+    """
+    dataset = TensorDataset(X, X_spectral, y)
+    
+    if is_train:
+        sampler = DynamicBatchSampler(y, batch_size)
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=4,
+            pin_memory=True
+        )
+    else:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True
+        )
+
+# Add these to functions.py
+
+def get_class_weights(y):
+    """
+    Compute class weights using effective numbers approach
+    
+    Args:
+        y: Labels tensor
+        
+    Returns:
+        Tensor of class weights
+    """
+    class_counts = torch.bincount(y)
+    total = class_counts.sum()
+    
+    # Use effective numbers
+    beta = 0.9999
+    effective_num = 1.0 - torch.pow(beta, class_counts)
+    weights = (1.0 - beta) / effective_num
+    
+    # Normalize weights
+    weights = weights / weights.sum() * len(class_counts)
+    
+    logging.info("\nComputed class weights:")
+    for i, weight in enumerate(weights):
+        logging.info(f"    Class {i}: {weight:.4f}")
+    
+    return weights
+
+def create_data_loaders(X, X_spectral, y, batch_size, is_train=True):
+    """
+    Create data loaders with dynamic batch sampling for training
+    """
+    dataset = TensorDataset(X, X_spectral, y)
+    
+    if is_train:
+        # Use dynamic batch sampling for training
+        sampler = DynamicBatchSampler(
+            labels=y,
+            batch_size=batch_size,
+            drop_last=False
+        )
+        return DataLoader(
+            dataset,
+            batch_sampler=sampler,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True
+        )
+    else:
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4,
+            pin_memory=True,
+            persistent_workers=True
+        )
+
+def improved_oversample(X, X_spectral, y, target_count=None):
+    """
+    Enhanced oversampling with proper tensor handling
+    """
+    # Ensure all inputs are tensors
+    X = torch.as_tensor(X, dtype=torch.float32)
+    X_spectral = torch.as_tensor(X_spectral, dtype=torch.float32)
+    y = torch.as_tensor(y, dtype=torch.long)
+    
+    class_counts = Counter(y.numpy())
+    
+    if target_count is None:
+        target_count = max(class_counts.values())
+    
+    logging.info("\nOversampling targets:")
+    for cls in sorted(class_counts.keys()):
+        current = class_counts[cls]
+        logging.info(f"    {SLEEP_STAGES[cls]}: {current} → {target_count}")
+    
+    oversampled_data = []
+    
+    for cls in sorted(class_counts.keys()):
+        class_mask = y == cls
+        X_class = X[class_mask]
+        X_spectral_class = X_spectral[class_mask]
+        current_count = len(X_class)
+        
+        # Add original samples
+        oversampled_data.append((X_class, X_spectral_class, torch.full((current_count,), cls, dtype=torch.long)))
         
         if current_count < target_count:
-            n_oversample = target_count - current_count
+            n_synthetic = target_count - current_count
             
-            # For very small classes, use augmentation
-            if current_count < 10:
-                aug_samples = []
-                aug_spectral = []
-                for _ in range(n_oversample):
-                    idx = np.random.choice(class_indices)
-                    # Apply time warping with random parameters
-                    augmented = time_warp(
-                        X[idx:idx+1], 
-                        sigma=np.random.uniform(0.1, 0.4),
-                        knot=np.random.randint(4, 7)
-                    )
-                    aug_samples.append(torch.from_numpy(augmented).squeeze(0))
-                    aug_spectral.append(X_spectral[idx])
+            synthetic_X = []
+            synthetic_X_spectral = []
+            
+            while len(synthetic_X) < n_synthetic:
+                try:
+                    # Sample with replacement
+                    idx = torch.randint(0, current_count, (min(n_synthetic - len(synthetic_X), 100),))
+                    samples = X_class[idx]
+                    
+                    # Apply augmentation
+                    augmented = time_warp(samples)
+                    
+                    # Add noise
+                    noise_mask = torch.rand(len(augmented)) < 0.5
+                    if noise_mask.any():
+                        noise = torch.randn_like(augmented[noise_mask]) * 0.02
+                        augmented[noise_mask] += noise
+                    
+                    synthetic_X.append(augmented)
+                    synthetic_X_spectral.append(X_spectral_class[idx])
+                    
+                except Exception as e:
+                    logging.warning(f"Augmentation failed for class {cls}: {str(e)}")
+                    continue
+            
+            if synthetic_X:
+                synthetic_X = torch.cat(synthetic_X, dim=0)
+                synthetic_X_spectral = torch.cat(synthetic_X_spectral, dim=0)
                 
-                oversampled_X.append(torch.stack(aug_samples))
-                oversampled_X_spectral.append(torch.stack(aug_spectral))
-                oversampled_y.extend([class_label] * n_oversample)
-            else:
-                # For larger minority classes, use random oversampling
-                oversample_idx = np.random.choice(class_indices, size=n_oversample, replace=True)
-                oversampled_X.append(X[oversample_idx])
-                oversampled_X_spectral.append(X_spectral[oversample_idx])
-                oversampled_y.extend([class_label] * n_oversample)
+                # Trim to exact size needed
+                if len(synthetic_X) > n_synthetic:
+                    synthetic_X = synthetic_X[:n_synthetic]
+                    synthetic_X_spectral = synthetic_X_spectral[:n_synthetic]
+                
+                oversampled_data.append((
+                    synthetic_X,
+                    synthetic_X_spectral,
+                    torch.full((len(synthetic_X),), cls, dtype=torch.long)
+                ))
     
-    return (torch.cat(oversampled_X), 
-            torch.cat(oversampled_X_spectral), 
-            torch.tensor(oversampled_y))
+    # Combine all data
+    X_combined = torch.cat([x for x, _, _ in oversampled_data])
+    X_spectral_combined = torch.cat([x_s for _, x_s, _ in oversampled_data])
+    y_combined = torch.cat([y_cls for _, _, y_cls in oversampled_data])
+    
+    # Shuffle
+    perm = torch.randperm(len(y_combined))
+    X_combined = X_combined[perm]
+    X_spectral_combined = X_spectral_combined[perm]
+    y_combined = y_combined[perm]
+    
+    return X_combined, X_spectral_combined, y_combined
 
 
 def get_scheduler(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
@@ -635,14 +1405,6 @@ def find_lr(model, train_loader, val_loader, optimizer, criterion, device, num_i
         if 'plt' in locals():
             plt.close()
 
-
-def get_class_weights(y):
-    class_counts = torch.bincount(y)
-    class_weights = 1. / class_counts.float()
-    # Apply sqrt to reduce extreme weights
-    class_weights = torch.sqrt(class_weights)
-    class_weights = class_weights / class_weights.sum()
-    return class_weights
 
 
 def objective(trial, X, X_spectral, y, device, n_folds=5, start_with_config=False):
@@ -853,8 +1615,35 @@ def objective(trial, X, X_spectral, y, device, n_folds=5, start_with_config=Fals
                 cv_scores.append(0.0)
                 continue
 
+        # mean_accuracy = np.mean(cv_scores)
+        # std_accuracy = np.std(cv_scores)
+
+        # # Log detailed results
+        # logging.info(f"""Trial completed:
+        # Parameters: {model_params}
+        # Batch size: {batch_size}
+        # Learning rate: {lr:.2e}
+        # Mean accuracy: {mean_accuracy:.4f} ± {std_accuracy:.4f}
+        # Best fold accuracy: {max(cv_scores):.4f}
+        # Worst fold accuracy: {min(cv_scores):.4f}
+        # """)
+
+        # return mean_accuracy
+
+    # except Exception as e:
+    # logging.error(f"Error in objective function: {str(e)}")
+    # return 0.0
+
+        # After calculating all fold scores
         mean_accuracy = np.mean(cv_scores)
         std_accuracy = np.std(cv_scores)
+
+        # Calculate and store per-class metrics from the best fold
+        best_fold_idx = np.argmax(cv_scores)
+        best_fold_metrics = fold_metrics[best_fold_idx]
+        
+        # Store metrics in trial user attributes
+        trial.set_user_attr('metrics', best_fold_metrics['val_class_accuracies'][-1])
 
         # Log detailed results
         logging.info(f"""Trial completed:
@@ -871,47 +1660,103 @@ def objective(trial, X, X_spectral, y, device, n_folds=5, start_with_config=Fals
     except Exception as e:
         logging.error(f"Error in objective function: {str(e)}")
         return 0.0
+    
 
 def run_hyperparameter_tuning(X, X_spectral, y, device, n_trials=50, start_with_config=False):
-    n_trials = CONFIG['train_params']['tuning_ranges'].get('n_trials', n_trials)
-
-    try:
-        study = create_study(direction='maximize', sampler=TPESampler())
-
-        # Wrap the objective function to include error handling
-        def objective_wrapper(trial):
-            try:
-                # Clear memory and cache before each trial
+    """
+    Run hyperparameter optimization with memory management and cross-validation
+    
+    Args:
+        X: Input data
+        X_spectral: Spectral features
+        y: Target labels
+        device: Device to run on
+        n_trials: Number of optimization trials
+        start_with_config: Whether to start with config parameters
+    """
+    study = optuna.create_study(
+        direction='maximize',
+        sampler=TPESampler(seed=CONFIG['settings']['seed'])
+    )
+    
+    # Wrap the objective function to include memory management
+    def objective_wrapper(trial):
+        try:
+            # Clear memory before each trial
+            if device.type == 'cuda':
                 torch.cuda.empty_cache()
-                gc.collect()  # Free Python memory
-
-                return objective(trial, X, X_spectral, y, device, start_with_config=start_with_config)
-            except Exception as e:
-                logging.error(f"Error in trial: {str(e)}")
-                return 0.0
-
-        study.optimize(objective_wrapper, n_trials=n_trials)
-        best_params = study.best_params
-        if not best_params:  # If no successful trials
-            logging.warning("No successful trials. Using initial parameters.")
-            best_params = CONFIG['model_params']['initial']
-            best_params.update({
-                'lr': CONFIG['train_params']['initial']['lr'],
-                'batch_size': CONFIG['train_params']['initial']['batch_size']
-            })
+                gc.collect()
             
-        logging.info(f"Best hyperparameters: {best_params}")
+            # Log memory state at start of trial
+            if device.type == 'cuda':
+                memory_allocated = torch.cuda.memory_allocated(device) / 1e9
+                memory_reserved = torch.cuda.memory_reserved(device) / 1e9
+                logging.info(f"\nStarting trial with memory state:")
+                logging.info(f"    Allocated: {memory_allocated:.2f}GB")
+                logging.info(f"    Reserved: {memory_reserved:.2f}GB")
+            
+            # Run the original objective function
+            result = objective(
+                trial=trial,
+                X=X,
+                X_spectral=X_spectral,
+                y=y,
+                device=device,
+                n_folds=5,
+                start_with_config=start_with_config
+            )
+            
+            # Log trial results
+            logging.info(f"\nTrial finished with accuracy: {result:.4f}")
+            
+            return result
+            
+        except Exception as e:
+            logging.error(f"Trial failed: {str(e)}")
+            raise optuna.exceptions.TrialPruned()
+        
+        finally:
+            # Cleanup after trial
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+                gc.collect()
+    
+    # Run optimization with proper exception handling
+    try:
+        study.optimize(
+            objective_wrapper,
+            n_trials=n_trials,
+            callbacks=[
+                lambda study, trial: logging.info(f"\nBest value so far: {study.best_value:.4f}")
+            ]
+        )
+        
+        # Log results
+        logging.info("\nHyperparameter optimization completed:")
+        logging.info(f"Best trial accuracy: {study.best_value:.4f}")
+        logging.info("Best hyperparameters:")
+        for param, value in study.best_params.items():
+            logging.info(f"    {param}: {value}")
+        
+        # Create a complete parameter set
+        best_params = {}
+        if start_with_config:
+            # Start with initial configuration
+            best_params.update(CONFIG['model_params']['initial'])
+            best_params.update(CONFIG['train_params']['initial'])
+        
+        # Update with optimized parameters
+        best_params.update(study.best_params)
+        
         return best_params
         
     except Exception as e:
-        logging.error(f"Error in hyperparameter tuning: {str(e)}")
-        # Return default parameters if tuning fails
-        default_params = CONFIG['model_params']['initial']
-        default_params.update({
-            'lr': CONFIG['train_params']['initial']['lr'],
-            'batch_size': CONFIG['train_params']['initial']['batch_size']
-        })
-        return default_params
+        logging.error(f"Hyperparameter optimization failed: {str(e)}")
+        logging.info("Falling back to default parameters")
+        return {
+            **CONFIG['model_params']['initial'],
+            **CONFIG['train_params']['initial']
+        }
 
 
 def plot_training_history(metrics_history):
@@ -938,157 +1783,505 @@ def plot_training_history(metrics_history):
     plt.savefig(os.path.join(CONFIG['model_dir'], 'training_history.png'))
     plt.close()
 
-def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
-                device, epochs=100, accumulation_steps=4, verbose=True):
-    scaler = GradScaler()
-    early_stopping = EarlyStopping(
-        patience=CONFIG['train_params']['initial']['early_stopping']['patience'],
-        min_epochs=CONFIG['train_params']['initial']['early_stopping']['min_epochs'],
-        min_delta=CONFIG['train_params']['initial']['early_stopping']['min_delta'],
-        monitor=CONFIG['train_params']['initial']['early_stopping']['monitor'],
-        mode='auto'
-    )
+# def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
+#                 device, epochs=100, accumulation_steps=4, verbose=True):
+#     scaler = GradScaler()
+#     early_stopping = EarlyStopping(
+#         patience=CONFIG['train_params']['initial']['early_stopping']['patience'],
+#         min_epochs=CONFIG['train_params']['initial']['early_stopping']['min_epochs'],
+#         min_delta=CONFIG['train_params']['initial']['early_stopping']['min_delta'],
+#         monitor=CONFIG['train_params']['initial']['early_stopping']['monitor'],
+#         mode='auto'
+#     )
     
-    metrics_history = {
-        'train_loss': [],
-        'val_loss': [],
-        'val_accuracy': [],
-        'class_accuracies': []  # Track per-class performance
-    }
+#     metrics_history = {
+#         'train_loss': [],
+#         'val_loss': [],
+#         'val_accuracy': [],
+#         'class_accuracies': []  # Track per-class performance
+#     }
     
-    for epoch in tqdm(range(epochs), desc="Training Progress"):
-        # Training phase
-        model.train()
-        running_loss = 0.0
-        predictions = []
-        true_labels = []
+#     for epoch in tqdm(range(epochs), desc="Training Progress"):
+#         # Training phase
+#         model.train()
+#         running_loss = 0.0
+#         predictions = []
+#         true_labels = []
         
-        for batch_idx, (batch_x, batch_x_spectral, batch_y) in enumerate(train_loader):
+#         for batch_idx, (batch_x, batch_x_spectral, batch_y) in enumerate(train_loader):
+#             try:
+#                 batch_x = batch_x.to(device)
+#                 batch_x_spectral = batch_x_spectral.to(device)
+#                 batch_y = batch_y.to(device)
+                
+#                 # Perform mixed precision training with autocast
+#                 with autocast(device_type=device.type if device.type != 'cpu' else 'cpu'):
+#                     outputs = model(batch_x, batch_x_spectral)
+#                     loss = criterion(outputs, batch_y)
+#                     loss = loss / accumulation_steps
+                
+#                 if device.type == 'cpu':
+#                     loss.backward()
+#                     if (batch_idx + 1) % accumulation_steps == 0:
+#                         optimizer.step()
+#                         optimizer.zero_grad()
+#                 else:
+#                     scaler.scale(loss).backward()
+#                     if (batch_idx + 1) % accumulation_steps == 0:
+#                         scaler.unscale_(optimizer)
+#                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+#                         scaler.step(optimizer)
+#                         scaler.update()
+#                         optimizer.zero_grad()
+
+#                 running_loss += loss.item() * accumulation_steps
+                
+#                 # Store predictions and true labels for per-class metrics
+#                 predictions.extend(outputs.argmax(dim=1).cpu().numpy())
+#                 true_labels.extend(batch_y.cpu().numpy())
+                
+#                 if device.type == 'cuda' and batch_idx % 50 == 0:
+#                     allocated_memory = torch.cuda.memory_allocated(device) / 1e6
+#                     logging.info(f"Allocated GPU memory after {batch_idx} batches: {allocated_memory} MB")
+
+#             except RuntimeError as e:
+#                 if "CUDA" in str(e):
+#                     logging.error(f"CUDA error during training: {str(e)}")
+#                     device = torch.device('cpu')
+#                     model = model.cpu()
+#                     batch_x = batch_x.cpu()
+#                     batch_x_spectral = batch_x_spectral.cpu()
+#                     batch_y = batch_y.cpu()
+#                     continue
+#                 else:
+#                     raise e
+
+#         # Calculate per-class metrics for training
+#         train_class_accuracies = {}
+#         for class_idx in range(len(torch.unique(batch_y))):
+#             mask = np.array(true_labels) == class_idx
+#             if np.sum(mask) > 0:
+#                 class_acc = np.mean(np.array(predictions)[mask] == class_idx)
+#                 train_class_accuracies[f'class_{class_idx}'] = class_acc
+
+#         # Validation phase
+#         model.eval()
+#         val_loss, val_accuracy, val_predictions = evaluate_model(
+#             model, val_data, criterion, device
+#         )
+        
+#         # Calculate per-class metrics for validation
+#         val_class_accuracies = {}
+#         for class_idx in range(len(torch.unique(val_data[2]))):
+#             mask = val_data[2].cpu().numpy() == class_idx
+#             if np.sum(mask) > 0:
+#                 class_acc = np.mean(val_predictions[mask] == class_idx)
+#                 val_class_accuracies[f'class_{class_idx}'] = class_acc
+        
+#         # Update learning rate
+#         scheduler.step(val_loss)
+        
+#         # Store metrics
+#         metrics_history['train_loss'].append(running_loss/len(train_loader))
+#         metrics_history['val_loss'].append(val_loss)
+#         metrics_history['val_accuracy'].append(val_accuracy)
+#         metrics_history['class_accuracies'].append(val_class_accuracies)
+        
+#         # Check early stopping
+#         should_stop = early_stopping(
+#             metrics={'loss': val_loss, 'accuracy': val_accuracy},
+#             epoch=epoch,
+#             state_dict=model.state_dict()
+#         )
+        
+#         if verbose:
+#             current_lr = optimizer.param_groups[0]['lr']
+#             print(f"Epoch {epoch+1}/{epochs}")
+#             print(f"Loss: {running_loss/len(train_loader):.4f}")
+#             print(f"Val Loss: {val_loss:.4f}")
+#             print(f"Val Accuracy: {val_accuracy:.4f}")
+#             print("Per-class validation accuracies:")
+#             # for class_name, acc in val_class_accuracies.items():
+#             #     print(f"{class_name}: {acc:.4f}")
+#             log_class_metrics(val_class_accuracies, prefix="    ")
+#             print(f"Learning Rate: {current_lr:.6f}")
+        
+#         if should_stop:
+#             print(f"Early stopping triggered at epoch {epoch+1}")
+#             break
+            
+#     # Plot training history with per-class metrics
+#     plot_training_history(metrics_history)
+    
+#     return early_stopping.best_state, metrics_history['val_accuracy'][early_stopping.best_epoch]
+
+def train_model(model, train_loader, val_data, optimizer, scheduler, criterion, 
+                device, monitor, early_stopping, epochs, writer):
+    """
+    Train the model with comprehensive monitoring and memory management
+    
+    Args:
+        model: The model to train
+        train_loader: DataLoader for training data
+        val_data: Tuple of (X, X_spectral, y, night_indices) for validation
+        optimizer: The optimizer
+        scheduler: Learning rate scheduler
+        criterion: Loss function
+        device: Device to train on
+        monitor: TrainingMonitor instance
+        early_stopping: EarlyStoppingWithClassMetrics instance
+        epochs: Number of epochs to train
+        writer: TensorBoard writer
+    """
+    scaler = torch.cuda.amp.GradScaler()
+    best_model = None
+    best_metrics = None
+    
+    logging.info("\nStarting training:")
+    logging.info(f"    Total epochs: {epochs}")
+    logging.info(f"    Batch size: {next(iter(train_loader))[0].shape[0]}")
+    logging.info(f"    Device: {device}")
+    
+    try:
+        for epoch in range(epochs):
+            # Training phase
+            model.train()
+            monitor.reset_metrics()
+            epoch_loss = 0.0
+            
+            # Create progress bar
+            train_iter = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
+            
+            for batch_idx, (batch_x, batch_x_spectral, batch_y, batch_nights) in enumerate(train_iter):
+                try:
+                    # Move data to device
+                    batch_x = batch_x.to(device)
+                    batch_x_spectral = batch_x_spectral.to(device)
+                    batch_y = batch_y.to(device)
+                    batch_nights = batch_nights.to(device)
+                    
+                    # Forward pass with mixed precision
+                    optimizer.zero_grad()
+                    with torch.cuda.amp.autocast():
+                        outputs = model(batch_x, batch_x_spectral)
+                        loss = criterion(outputs, batch_y, batch_nights)
+                    
+                    # Backward pass
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    
+                    # Update metrics
+                    epoch_loss += loss.item()
+                    monitor.update(outputs, batch_y, loss, model)
+                    
+                    # Update progress bar
+                    train_iter.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'lr': f'{optimizer.param_groups[0]["lr"]:.2e}'
+                    })
+                    
+                    # Check memory usage
+                    if device.type == 'cuda' and (batch_idx + 1) % 10 == 0:
+                        memory_allocated = torch.cuda.memory_allocated(device) / 1e9
+                        memory_reserved = torch.cuda.memory_reserved(device) / 1e9
+                        if memory_allocated > CONFIG['runtime']['memory_management']['max_batch_memory']:
+                            logging.warning(f"High memory usage: {memory_allocated:.2f}GB allocated")
+                            torch.cuda.empty_cache()
+                
+                except RuntimeError as e:
+                    if "out of memory" in str(e):
+                        logging.error("GPU OOM in training batch. Attempting recovery...")
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                        continue
+                    raise e
+            
+            # Get and log training metrics
+            train_metrics = monitor.get_metrics()
+            monitor.update_history(train_metrics, 'train')
+            monitor.log_metrics(train_metrics, 'train', epoch)
+            
+            # Validation phase
+            model.eval()
+            val_loss = 0.0
+            val_metrics = defaultdict(float)
+            
+            X_val, X_val_spectral, y_val, night_indices_val = val_data
+            
             try:
+                with torch.no_grad():
+                    for i in range(0, len(X_val), CONFIG['runtime']['evaluation']['batch_size']):
+                        end_idx = min(i + CONFIG['runtime']['evaluation']['batch_size'], len(X_val))
+                        val_batch_x = X_val[i:end_idx].to(device)
+                        val_batch_spectral = X_val_spectral[i:end_idx].to(device)
+                        val_batch_y = y_val[i:end_idx].to(device)
+                        val_batch_nights = night_indices_val[i:end_idx].to(device)
+                        
+                        outputs = model(val_batch_x, val_batch_spectral)
+                        loss = criterion(outputs, val_batch_y, val_batch_nights)
+                        
+                        val_loss += loss.item() * len(val_batch_y)
+                        monitor.update(outputs, val_batch_y, loss, model)
+                        
+                        if device.type == 'cuda':
+                            torch.cuda.empty_cache()
+                
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logging.error("GPU OOM during validation. Reducing batch size...")
+                    CONFIG['runtime']['evaluation']['batch_size'] //= 2
+                    continue
+                raise e
+            
+            # Get validation metrics
+            val_metrics = monitor.get_metrics()
+            monitor.update_history(val_metrics, 'val')
+            monitor.log_metrics(val_metrics, 'val', epoch)
+            
+            # Update learning rate
+            scheduler.step(val_metrics['loss'])
+            
+            # Log to TensorBoard
+            writer.add_scalar('Loss/train', train_metrics['loss'], epoch)
+            writer.add_scalar('Loss/validation', val_metrics['loss'], epoch)
+            writer.add_scalar('Accuracy/train', train_metrics['accuracy'], epoch)
+            writer.add_scalar('Accuracy/validation', val_metrics['accuracy'], epoch)
+            writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
+            
+            # Plot training progress
+            monitor.plot_metrics(epoch)
+            
+            # Check early stopping
+            if early_stopping(val_metrics, model.state_dict(), epoch):
+                logging.info(f"\nEarly stopping triggered at epoch {epoch+1}")
+                best_model = early_stopping.best_weights
+                best_metrics = val_metrics
+                break
+            
+            if val_metrics['accuracy'] > (best_metrics['accuracy'] if best_metrics else 0):
+                best_model = model.state_dict()
+                best_metrics = val_metrics
+        
+        return best_model, best_metrics
+        
+    except Exception as e:
+        logging.error(f"Error during training: {str(e)}", exc_info=True)
+        raise
+    finally:
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+
+
+# def evaluate_model(model, data, criterion, device, batch_size=32):
+#     """
+#     Evaluate model with batched processing to prevent memory overflow
+    
+#     Args:
+#         model: The model to evaluate
+#         data: Tuple of (X, X_spectral, y)
+#         criterion: Loss function
+#         device: Device to run evaluation on
+#         batch_size: Batch size for evaluation
+#     """
+#     model.eval()
+#     X, X_spectral, y = data
+#     total_loss = 0
+#     all_predictions = []
+#     total_samples = len(y)
+    
+#     # Create batches
+#     num_batches = (total_samples + batch_size - 1) // batch_size
+    
+#     with torch.no_grad():
+#         for i in range(num_batches):
+#             start_idx = i * batch_size
+#             end_idx = min((i + 1) * batch_size, total_samples)
+            
+#             # Get batch
+#             batch_X = X[start_idx:end_idx].to(device)
+#             batch_X_spectral = X_spectral[start_idx:end_idx].to(device)
+#             batch_y = y[start_idx:end_idx].to(device)
+            
+#             try:
+#                 # Forward pass
+#                 outputs = model(batch_X, batch_X_spectral)
+#                 loss = criterion(outputs, batch_y)
+                
+#                 # Accumulate loss
+#                 total_loss += loss.item() * len(batch_y)
+                
+#                 # Get predictions
+#                 _, predicted = torch.max(outputs, 1)
+#                 all_predictions.extend(predicted.cpu().numpy())
+                
+#                 # Clear cache after each batch
+#                 if device.type == 'cuda':
+#                     torch.cuda.empty_cache()
+                    
+#             except RuntimeError as e:
+#                 if "out of memory" in str(e):
+#                     if device.type == 'cuda':
+#                         torch.cuda.empty_cache()
+#                     logging.error(f"GPU OOM in batch {i+1}/{num_batches}. Try reducing batch_size.")
+#                     raise
+#                 else:
+#                     raise
+    
+#     # Calculate metrics
+#     all_predictions = np.array(all_predictions)
+#     accuracy = (all_predictions == y.cpu().numpy()).mean()
+#     avg_loss = total_loss / total_samples
+    
+#     return avg_loss, accuracy, all_predictions
+
+def evaluate_model(model, data, criterion, device, batch_size=32):
+    """
+    Evaluate model with comprehensive metrics and error handling
+    
+    Args:
+        model: The model to evaluate
+        data: Tuple of (X, X_spectral, y)
+        criterion: Loss function
+        device: Device to run evaluation on
+        batch_size: Batch size for evaluation
+    """
+    model.eval()
+    X, X_spectral, y = data
+    total_loss = 0
+    class_correct = defaultdict(int)
+    class_total = defaultdict(int)
+    predictions = []
+    total_samples = len(y)
+    
+    # Calculate number of batches
+    num_batches = (total_samples + batch_size - 1) // batch_size
+    
+    try:
+        with torch.no_grad():
+            for i in range(num_batches):
+                start_idx = i * batch_size
+                end_idx = min((i + 1) * batch_size, total_samples)
+                
+                # Get batch
+                batch_X = X[start_idx:end_idx].to(device)
+                batch_X_spectral = X_spectral[start_idx:end_idx].to(device)
+                batch_y = y[start_idx:end_idx].to(device)
+                
+                # Forward pass
+                outputs = model(batch_X, batch_X_spectral)
+                loss = criterion(outputs, batch_y)
+                
+                # Accumulate loss and predictions
+                total_loss += loss.item() * len(batch_y)
+                batch_preds = outputs.argmax(dim=1).cpu().numpy()
+                predictions.extend(batch_preds)
+                
+                # Update class-wise metrics
+                for cls in range(len(SLEEP_STAGES)):
+                    mask = batch_y == cls
+                    class_total[cls] += mask.sum().item()
+                    class_correct[cls] += ((batch_preds == cls) & 
+                                         (batch_y.cpu().numpy() == cls)).sum()
+                
+                # Clear cache if using GPU
+                if device.type == 'cuda' and (i + 1) % 10 == 0:
+                    torch.cuda.empty_cache()
+        
+        # Calculate metrics
+        predictions = np.array(predictions)
+        true_labels = y.cpu().numpy()
+        
+        # Calculate overall metrics
+        accuracy = (predictions == true_labels).mean()
+        avg_loss = total_loss / total_samples
+        
+        # Calculate class-wise metrics
+        class_accuracies = {}
+        for cls in range(len(SLEEP_STAGES)):
+            if class_total[cls] > 0:
+                class_accuracies[cls] = class_correct[cls] / class_total[cls]
+            else:
+                class_accuracies[cls] = 0.0
+        
+        # Log detailed metrics
+        logging.info("\nEvaluation Results:")
+        logging.info(f"    Overall Accuracy: {accuracy:.4f}")
+        logging.info(f"    Average Loss: {avg_loss:.4f}")
+        logging.info("\nClass-wise Accuracies:")
+        for cls, acc in class_accuracies.items():
+            logging.info(f"    {SLEEP_STAGES[cls]}: {acc:.4f} ({class_total[cls]} samples)")
+        
+        return avg_loss, accuracy, predictions
+        
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+            logging.warning("GPU OOM during evaluation. Trying with smaller batch size...")
+            return evaluate_model(model, data, criterion, device, batch_size=batch_size//2)
+        raise
+    except Exception as e:
+        logging.error(f"Error during evaluation: {str(e)}")
+        raise
+   
+
+def validate_model(model, val_loader, criterion, device):
+    """
+    Validate model during training with class-wise metrics
+    
+    Args:
+        model: The model to validate
+        val_loader: Validation data loader
+        criterion: Loss function
+        device: Device to run validation on
+    """
+    model.eval()
+    val_loss = 0
+    class_correct = defaultdict(int)
+    class_total = defaultdict(int)
+    
+    try:
+        with torch.no_grad():
+            for batch_x, batch_x_spectral, batch_y in val_loader:
                 batch_x = batch_x.to(device)
                 batch_x_spectral = batch_x_spectral.to(device)
                 batch_y = batch_y.to(device)
                 
-                # Perform mixed precision training with autocast
-                with autocast(device_type=device.type if device.type != 'cpu' else 'cpu'):
-                    outputs = model(batch_x, batch_x_spectral)
-                    loss = criterion(outputs, batch_y)
-                    loss = loss / accumulation_steps
+                outputs = model(batch_x, batch_x_spectral)
+                loss = criterion(outputs, batch_y)
+                val_loss += loss.item()
                 
-                if device.type == 'cpu':
-                    loss.backward()
-                    if (batch_idx + 1) % accumulation_steps == 0:
-                        optimizer.step()
-                        optimizer.zero_grad()
-                else:
-                    scaler.scale(loss).backward()
-                    if (batch_idx + 1) % accumulation_steps == 0:
-                        scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                        scaler.step(optimizer)
-                        scaler.update()
-                        optimizer.zero_grad()
-
-                running_loss += loss.item() * accumulation_steps
+                _, predicted = torch.max(outputs, 1)
+                correct = predicted == batch_y
                 
-                # Store predictions and true labels for per-class metrics
-                predictions.extend(outputs.argmax(dim=1).cpu().numpy())
-                true_labels.extend(batch_y.cpu().numpy())
-                
-                if device.type == 'cuda' and batch_idx % 50 == 0:
-                    allocated_memory = torch.cuda.memory_allocated(device) / 1e6
-                    logging.info(f"Allocated GPU memory after {batch_idx} batches: {allocated_memory} MB")
-
-            except RuntimeError as e:
-                if "CUDA" in str(e):
-                    logging.error(f"CUDA error during training: {str(e)}")
-                    device = torch.device('cpu')
-                    model = model.cpu()
-                    batch_x = batch_x.cpu()
-                    batch_x_spectral = batch_x_spectral.cpu()
-                    batch_y = batch_y.cpu()
-                    continue
-                else:
-                    raise e
-
-        # Calculate per-class metrics for training
-        train_class_accuracies = {}
-        for class_idx in range(len(torch.unique(batch_y))):
-            mask = np.array(true_labels) == class_idx
-            if np.sum(mask) > 0:
-                class_acc = np.mean(np.array(predictions)[mask] == class_idx)
-                train_class_accuracies[f'class_{class_idx}'] = class_acc
-
-        # Validation phase
-        model.eval()
-        val_loss, val_accuracy, val_predictions = evaluate_model(
-            model, val_data, criterion, device
-        )
+                # Update class-wise metrics
+                for cls in range(len(SLEEP_STAGES)):
+                    mask = batch_y == cls
+                    class_correct[cls] += correct[mask].sum().item()
+                    class_total[cls] += mask.sum().item()
         
-        # Calculate per-class metrics for validation
-        val_class_accuracies = {}
-        for class_idx in range(len(torch.unique(val_data[2]))):
-            mask = val_data[2].cpu().numpy() == class_idx
-            if np.sum(mask) > 0:
-                class_acc = np.mean(val_predictions[mask] == class_idx)
-                val_class_accuracies[f'class_{class_idx}'] = class_acc
+        # Calculate metrics
+        avg_loss = val_loss / len(val_loader)
+        class_accuracies = {
+            cls: class_correct[cls] / max(class_total[cls], 1)
+            for cls in range(len(SLEEP_STAGES))
+        }
+        overall_accuracy = sum(class_correct.values()) / sum(class_total.values())
         
-        # Update learning rate
-        scheduler.step(val_loss)
+        metrics = {
+            'loss': avg_loss,
+            'accuracy': overall_accuracy,
+            'class_accuracies': class_accuracies
+        }
         
-        # Store metrics
-        metrics_history['train_loss'].append(running_loss/len(train_loader))
-        metrics_history['val_loss'].append(val_loss)
-        metrics_history['val_accuracy'].append(val_accuracy)
-        metrics_history['class_accuracies'].append(val_class_accuracies)
+        return metrics
         
-        # Check early stopping
-        should_stop = early_stopping(
-            metrics={'loss': val_loss, 'accuracy': val_accuracy},
-            epoch=epoch,
-            state_dict=model.state_dict()
-        )
-        
-        if verbose:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"Epoch {epoch+1}/{epochs}")
-            print(f"Loss: {running_loss/len(train_loader):.4f}")
-            print(f"Val Loss: {val_loss:.4f}")
-            print(f"Val Accuracy: {val_accuracy:.4f}")
-            print("Per-class validation accuracies:")
-            for class_name, acc in val_class_accuracies.items():
-                print(f"{class_name}: {acc:.4f}")
-            print(f"Learning Rate: {current_lr:.6f}")
-        
-        if should_stop:
-            print(f"Early stopping triggered at epoch {epoch+1}")
-            break
-            
-    # Plot training history with per-class metrics
-    plot_training_history(metrics_history)
-    
-    return early_stopping.best_state, metrics_history['val_accuracy'][early_stopping.best_epoch]
-
-def evaluate_model(model, data, criterion, device):
-    model.eval()
-    X, X_spectral, y = data
-    total_loss = 0
-    correct = 0
-    total = 0
-    all_predictions = []
-    
-    with torch.no_grad():
-        outputs = model(X.to(device), X_spectral.to(device))
-        loss = criterion(outputs, y.to(device))
-        total_loss += loss.item()
-        _, predicted = torch.max(outputs, 1)
-        all_predictions.extend(predicted.cpu().numpy())
-        total += y.size(0)
-        correct += (predicted == y.to(device)).sum().item()
-    
-    accuracy = correct / total
-    avg_loss = total_loss / total
-    return avg_loss, accuracy, np.array(all_predictions)
+    except Exception as e:
+        logging.error(f"Error during validation: {str(e)}")
+        raise
 
 def distill_knowledge(teacher_model, student_model, train_loader, val_data, device, num_epochs=50, log_interval=5):
     optimizer = optim.AdamW(student_model.parameters(), lr=1e-5, weight_decay=1e-2)
@@ -1144,3 +2337,159 @@ def distill_knowledge(teacher_model, student_model, train_loader, val_data, devi
     
     overall_progress.close()
     return student_model
+
+
+# Add these utility functions to functions.py
+
+def verify_data_balance(labels, threshold=0.1):
+    """
+    Verify if the class distribution is reasonably balanced
+    
+    Args:
+        labels: Tensor of class labels
+        threshold: Maximum allowed deviation from perfect balance
+    
+    Returns:
+        bool: Whether the distribution is balanced
+        dict: Class distribution statistics
+    """
+    class_counts = Counter(labels.numpy())
+    total_samples = len(labels)
+    perfect_share = 1.0 / len(class_counts)
+    
+    stats = {}
+    is_balanced = True
+    
+    for cls in sorted(class_counts.keys()):
+        share = class_counts[cls] / total_samples
+        deviation = abs(share - perfect_share)
+        stats[cls] = {
+            'count': class_counts[cls],
+            'share': share,
+            'deviation': deviation
+        }
+        
+        if deviation > threshold:
+            is_balanced = False
+    
+    return is_balanced, stats
+
+def format_time_elapsed(seconds):
+    """Format elapsed time in a human-readable format"""
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    seconds = seconds % 60
+    return f"{int(hours)}h {int(minutes)}m {int(seconds)}s"
+
+def log_gpu_memory_stats():
+    """Log detailed GPU memory statistics"""
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            allocated = torch.cuda.memory_allocated(i) / 1e9
+            reserved = torch.cuda.memory_reserved(i) / 1e9
+            logging.info(f"\nGPU {i} ({props.name}):")
+            logging.info(f"    Total memory: {props.total_memory/1e9:.2f}GB")
+            logging.info(f"    Allocated memory: {allocated:.2f}GB")
+            logging.info(f"    Reserved memory: {reserved:.2f}GB")
+
+def compute_class_statistics(y_true, y_pred):
+    """
+    Compute detailed per-class statistics
+    
+    Args:
+        y_true: True labels
+        y_pred: Predicted labels
+    
+    Returns:
+        dict: Dictionary containing per-class metrics
+    """
+    stats = {}
+    unique_classes = sorted(set(y_true))
+    
+    for cls in unique_classes:
+        mask = y_true == cls
+        cls_total = mask.sum()
+        cls_correct = (y_pred[mask] == cls).sum()
+        
+        stats[cls] = {
+            'total': int(cls_total),
+            'correct': int(cls_correct),
+            'accuracy': float(cls_correct) / float(cls_total) if cls_total > 0 else 0,
+            'share': float(cls_total) / len(y_true)
+        }
+    
+    return stats
+
+def validate_loaded_data(X, y, night_indices):
+    """
+    Validate loaded data format and dimensions
+    
+    Args:
+        X: Input signal data
+        y: Labels
+        night_indices: Night indices for each sample
+    """
+    # Check basic dimensions
+    assert X.ndim == 3, f"Expected X to be 3D (n_samples, n_channels, timepoints), got shape {X.shape}"
+    assert X.shape[1] == 4, f"Expected 4 channels, got {X.shape[1]}"
+    assert X.shape[2] == 3000, f"Expected 3000 timepoints, got {X.shape[2]}"
+    
+    # Check label dimensions
+    assert y.ndim == 1, f"Expected y to be 1D, got shape {y.shape}"
+    assert len(X) == len(y), f"Mismatch between X length ({len(X)}) and y length ({len(y)})"
+    
+    # Check night indices
+    assert len(night_indices) == len(y), "Night indices length mismatch"
+    
+    # Check data types
+    assert torch.is_tensor(X), "X should be a PyTorch tensor"
+    assert torch.is_tensor(y), "y should be a PyTorch tensor"
+    
+    # Check value ranges
+    assert torch.isfinite(X).all(), "X contains non-finite values"
+    assert y.min() >= 0 and y.max() <= 4, f"Invalid label values: min={y.min()}, max={y.max()}"
+    
+    # Log validation results
+    logging.info("\nData validation passed:")
+    logging.info(f"    X shape: {X.shape}")
+    logging.info(f"    y shape: {y.shape}")
+    logging.info(f"    Number of nights: {len(set(night_indices.numpy()))}")
+    logging.info(f"    Class distribution: {Counter(y.numpy())}")
+
+    def verify_tensor_types(X, X_spectral, y):
+        """Verify that all inputs are proper PyTorch tensors with correct dtypes"""
+        assert torch.is_tensor(X) and X.dtype == torch.float32, "X must be a float32 tensor"
+        assert torch.is_tensor(X_spectral) and X_spectral.dtype == torch.float32, "X_spectral must be a float32 tensor"
+        assert torch.is_tensor(y) and y.dtype == torch.long, "y must be a long tensor"
+
+
+def create_balanced_data_loaders(X, X_spectral, y, night_indices, batch_size, augment=True):
+    """Create data loaders with sophisticated balancing strategy"""
+    from tools.classes import BalancedSleepDataset  # Import here to avoid circular imports
+    
+    # Create dataset
+    dataset = BalancedSleepDataset(
+        X=X,
+        X_spectral=X_spectral,
+        y=y,
+        night_indices=night_indices,
+        augment=augment
+    )
+    
+    # Create sampler
+    sampler = WeightedRandomSampler(
+        weights=dataset.weights,
+        num_samples=len(dataset.weights),
+        replacement=True
+    )
+    
+    # Create and return data loader
+    return DataLoader(
+        dataset=dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=False
+    )

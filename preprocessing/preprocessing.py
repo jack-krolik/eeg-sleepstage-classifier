@@ -7,11 +7,26 @@ from scipy.interpolate import interp1d
 import matplotlib.pyplot as plt
 import torch
 from matplotlib.colors import ListedColormap
+import pandas as pd
+import logging
+import os
 
 # Constants
-PREPROCESSED_FILE_NAME = 'preprocessed_data.mat'
-EDF_PATH = '../data/201 N1.edf'
-SLEEP_STAGES_PATH = '../data/Sleep Stages 201_N1.txt'
+# PREPROCESSED_FILE_NAME = 'preprocessed_data_201_N1.mat'
+# EDF_PATH = '../data/201 N1.edf'
+# SLEEP_STAGES_PATH = '../data/SASE Sleep Stages 201_N1.xlsx'
+
+# PREPROCESSED_FILE_NAME = 'preprocessed_data_201_N2.mat'
+# EDF_PATH = '../data/201 N2.edf'
+# SLEEP_STAGES_PATH = '../data/SASE Sleep Stages 201_N2.xlsx'
+
+PREPROCESSED_FILE_NAME = 'preprocessed_data_202_N1.mat'
+EDF_PATH = '../data/202 N1.edf'
+SLEEP_STAGES_PATH = '../data/SASE Sleep Stages 202_N1.xlsx'
+
+# PREPROCESSED_FILE_NAME = 'preprocessed_data_202_N2.mat'
+# EDF_PATH = '../data/202 N2.edf'
+# SLEEP_STAGES_PATH = '../data/SASE Sleep Stages 202_N2.xlsx'
 
 # Configuration
 BANDPASS_FILTER = (0.5, 50)
@@ -65,23 +80,37 @@ def handle_artifacts(data, artifact_mask):
     data[artifact_mask] = 0
     return data
 
+
 def preprocess_sleep_stages(file_path, epochs_to_remove, keep_unscored=False):
     stage_mapping = {7: 4, 5: 3, 1: 2, 2: 1, 3: 0, 0: -1}
+    
+    # Check if the file is an Excel file
+    if file_path.endswith('.xlsx'):
+        # Load the Excel file, skipping the first two rows, and drop blank rows
+        df = pd.read_excel(file_path, skiprows=1)
+       
+        sleep_stages = df.iloc[:, 0].values  # Assuming sleep stages are in the first column
+    else:
+        # Load and process text file, skipping first two lines and stripping blank rows
+        with open(file_path, 'r') as file:
+            lines = [line.strip() for line in file.readlines()[2:] if line.strip()]  # Skip the first two lines and remove blanks
+        sleep_stages = np.array([int(line.split()[0]) for line in lines])
 
-    with open(file_path, 'r') as file:
-        lines = file.readlines()[2:]
-
-    sleep_stages = np.array([int(line.split()[0]) for line in lines])
-
+    # Find start and end indices of stage 7
     start_index = np.argmax(sleep_stages == 7)
     end_index = len(sleep_stages) - np.argmax(sleep_stages[::-1] == 7)
 
+    # Expand the range by 50 epochs before start and after end
     sleep_stages[max(0, start_index - 50):start_index] = 7
     sleep_stages[end_index:min(len(sleep_stages), end_index + 50)] = 7
 
+    # Process stages based on 'keep_unscored' flag
     processed_stages = sleep_stages if keep_unscored else sleep_stages[start_index:end_index]
 
+    # Map stages using the stage_mapping dictionary
     renumbered_stages = np.vectorize(stage_mapping.get)(processed_stages)
+
+    # Remove specified epochs
     np_stages = np.delete(renumbered_stages, list(epochs_to_remove), axis=0)
 
     return np_stages.reshape(1, -1)
@@ -99,7 +128,8 @@ def plot_channel(data, artifact_mask, channel_name, fs):
     artifact_indices = np.where(artifact_mask)[0]
     if artifact_indices.size > 0:
         plt.scatter(time[artifact_indices], data[artifact_indices], color='red', label="Artifact", marker='.', s=10)
-    plt.title(f'{channel_name} from 201 N1.edf (Preprocessed with Artifacts Highlighted)')
+    edf_file_name = os.path.basename(EDF_PATH) 
+    plt.title(f'{channel_name} from {edf_file_name}.edf (Preprocessed with Artifacts Highlighted)')
     plt.xlabel('Time (seconds)')
     plt.ylabel('Amplitude (μV)')
     plt.legend()
@@ -276,17 +306,30 @@ def plot_eeg_and_sleep_stages(x, y, fs, ch_names, start_epoch=0, num_epochs=None
     plt.subplots_adjust(bottom=0.1, right=.9)
     return fig
 
-
-    # Load and preprocess EEG data
+# Load EEG data and sleep stages
 raw = load_edf_file(EDF_PATH)
 raw = preprocess_eeg(raw)
 epochs = create_epochs(raw)
+
+
 
 # Initialize arrays to track artifacts
 num_epochs = epochs._data.shape[0]
 amplitude_artifact_counts = np.zeros(num_epochs)
 flat_artifact_counts = np.zeros(num_epochs)
 epochs_to_remove = []
+
+
+# Inspect EEG epochs and sleep stages length before any masking or indexing
+print(f"EEG data epochs shape: {epochs._data.shape}")  # Expecting [1175, 4, 3000] or similar
+sleep_stages = preprocess_sleep_stages(SLEEP_STAGES_PATH, epochs_to_remove, keep_unscored=True)
+print(f"Sleep stages shape: {sleep_stages.shape}")  # Expecting [1175] or similar
+
+# Ensure shapes are compatible before masking
+if epochs._data.shape[0] != sleep_stages.shape[1]:
+    logging.error(f"Mismatch found: EEG data has {epochs._data.shape[0]} epochs, but sleep stages has {sleep_stages.shape[1]}")
+else:
+    print("Shapes are compatible for masking operation.")
 
 # Apply artifact detection and handling
 for i in range(num_epochs):
@@ -373,10 +416,16 @@ except Exception as e:
 
 # Plot EEG data and sleep stages
 fig_eeg_stages = plot_eeg_and_sleep_stages(x, y, fs, ch_names)
+
 fig_eeg_stages.savefig('eeg_and_sleep_stages.png')
-plt.close(fig_eeg_stages)
+
 print("EEG and sleep stages plot saved as 'eeg_and_sleep_stages.png'")
 
 # Print number of sleep stages and epochs
 print(f"Number of sleep stages: {y.shape[0]}")
 print(f"Number of epochs: {x.shape[0]}")
+
+# Show the plot
+plt.show()
+plt.close(fig_eeg_stages)
+
