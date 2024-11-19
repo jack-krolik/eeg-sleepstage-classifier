@@ -125,7 +125,7 @@ CONFIG = {
         os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_202_N1.mat'),
         os.path.join(BASE_DIR, 'preprocessing', 'preprocessed_data_202_N2.mat'),
     ],
-    'model_dir': os.path.join(BASE_DIR, 'models', 'new4'),
+    'model_dir': os.path.join(BASE_DIR, 'models', 'new9'),
     'old_model_path': os.path.join(BASE_DIR, 'models', 'old'),
     
     'settings': {
@@ -137,7 +137,7 @@ CONFIG = {
             'device_id': 0,  # Default to first GPU
             'memory_fraction': 0.8,  # Use 80% of GPU memory
             'allow_growth': True,
-            'multi_gpu': False  # Set to True if you want to use multiple GPUs
+            'multi_gpu': False  # Set to True if you want to use multiple GPUs - WARNING: THIS HAS NOT BEEN IMPLEMENTED
         }
     },
     
@@ -212,12 +212,12 @@ CONFIG = {
 cuda_manager = CUDAManager.get_instance()
 device = cuda_manager.device
 
-if device.type == 'cuda':
-    # Set these after device is initialized
-    torch.backends.cudnn.enabled = True
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cudnn.deterministic = True
-    logging.info(f"Using CUDA device: {torch.cuda.get_device_name(device)}")
-    logging.info(f"CUDA Memory Available: {torch.cuda.get_device_properties(device).total_memory/1e9:.2f}GB")
-else:
-    logging.info("Using CPU device")
+# if device.type == 'cuda':
+#     # Set these after device is initialized
+#     torch.backends.cudnn.enabled = True
+#     torch.backends.cudnn.benchmark = True
+#     torch.backends.cudnn.deterministic = True
+#     logging.info(f"Using CUDA device: {torch.cuda.get_device_name(device)}")
+#     logging.info(f"CUDA Memory Available: {torch.cuda.get_device_properties(device).total_memory/1e9:.2f}GB")
+# else:
+#     logging.info("Using CPU device")

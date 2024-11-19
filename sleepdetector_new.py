@@ -195,7 +195,14 @@ class ImprovedSleepdetector(nn.Module):
                 (self.iqr_target[i] / (x[:, i].quantile(0.75, dim=-1, keepdim=True) - x[:, i].quantile(0.25, dim=-1, keepdim=True) + epsilon))
 
         # Normalize spectral features
-        spectral_features = (spectral_features - spectral_features.mean(dim=0, keepdim=True)) / (spectral_features.std(dim=0, keepdim=True) + epsilon)
+        # spectral_features = (spectral_features - spectral_features.mean(dim=0, keepdim=True)) / (spectral_features.std(dim=0, keepdim=True) + epsilon)
+
+        # Modified spectral features normalization
+        mean = spectral_features.mean(dim=0, keepdim=True)
+        std = spectral_features.std(dim=0, keepdim=True)
+        # Replace zero standard deviations with 1 to avoid division by zero
+        std = torch.where(std == 0, torch.ones_like(std), std)
+        spectral_features = (spectral_features - mean) / (std + epsilon)
 
         x_cnn = self.cnn(x)
         if not torch.isfinite(x_cnn).all():

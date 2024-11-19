@@ -1412,3 +1412,24 @@ def distill_knowledge(teacher_model, student_model, train_loader, val_data, devi
     return student_model
 
 
+def convert_to_serializable(obj):
+    """Convert objects to JSON serializable format"""
+    if isinstance(obj, (np.ndarray, torch.Tensor)):
+        return obj.tolist()
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, np.integer):
+        return int(obj)
+    elif isinstance(obj, np.floating):
+        return float(obj)
+    elif isinstance(obj, Counter):
+        return dict(obj)
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
+    elif isinstance(obj, dict):
+        return {key: convert_to_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(convert_to_serializable(item) for item in obj)
+    return obj

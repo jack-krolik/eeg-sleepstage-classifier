@@ -5,6 +5,7 @@ import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from collections import Counter
 
 SLEEP_STAGES = {
     0: 'N3 (Deep)',
@@ -97,89 +98,6 @@ Validation Metrics:
     
     return summary
 
-def log_confusion_matrix(confusion_mat, epoch, save_dir):
-    """Log and visualize confusion matrix"""
-    plt.figure(figsize=(12, 8))
-    sns.heatmap(confusion_mat, 
-                annot=True, 
-                fmt='d',
-                cmap='Blues',
-                xticklabels=[SLEEP_STAGES[i] for i in range(len(SLEEP_STAGES))],
-                yticklabels=[SLEEP_STAGES[i] for i in range(len(SLEEP_STAGES))])
-    plt.title(f'Confusion Matrix - Epoch {epoch + 1}')
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    
-    # Save the confusion matrix plot
-    plt.savefig(os.path.join(save_dir, f'confusion_matrix_epoch_{epoch + 1}.png'),
-                bbox_inches='tight')
-    plt.close()
-    
-    # Log confusion matrix details
-    logging.info("\nConfusion Matrix:")
-    class_names = [SLEEP_STAGES[i] for i in range(len(SLEEP_STAGES))]
-    
-    # Calculate and log precision, recall for each class
-    precisions = confusion_mat.diagonal() / confusion_mat.sum(axis=0)
-    recalls = confusion_mat.diagonal() / confusion_mat.sum(axis=1)
-    
-    for i, (class_name, precision, recall) in enumerate(zip(class_names, precisions, recalls)):
-        logging.info(f"{class_name}:")
-        logging.info(f"  Precision: {precision:.4f}")
-        logging.info(f"  Recall: {recall:.4f}")
-        logging.info(f"  Support: {confusion_mat[i].sum()}")
-
-def log_class_distribution(y, title="Class Distribution"):
-    """Log distribution of classes in a dataset"""
-    unique, counts = np.unique(y, return_counts=True)
-    total_samples = len(y)
-    
-    logging.info(f"\n{title}:")
-    for class_idx, count in zip(unique, counts):
-        percentage = (count / total_samples) * 100
-        logging.info(f"{SLEEP_STAGES[class_idx]}: {count} samples ({percentage:.2f}%)")
-
-def log_training_start(model, optimizer, scheduler, criterion):
-    """Log training configuration at start of training"""
-    logging.info("\nTraining Configuration:")
-    logging.info("-" * 80)
-    
-    # Log model architecture
-    logging.info("\nModel Architecture:")
-    logging.info(str(model))
-    
-    # Log optimizer settings
-    logging.info("\nOptimizer Settings:")
-    logging.info(f"Type: {type(optimizer).__name__}")
-    for param_group in optimizer.param_groups:
-        logging.info(f"Learning Rate: {param_group['lr']}")
-        logging.info(f"Weight Decay: {param_group.get('weight_decay', 'Not set')}")
-    
-    # Log scheduler settings
-    logging.info("\nScheduler Settings:")
-    logging.info(f"Type: {type(scheduler).__name__}")
-    
-    # Log criterion settings
-    logging.info("\nLoss Function:")
-    logging.info(f"Type: {type(criterion).__name__}")
-    
-    # Log device information
-    if torch.cuda.is_available():
-        logging.info("\nGPU Information:")
-        logging.info(f"Device: {torch.cuda.get_device_name(0)}")
-        logging.info(f"Memory Allocated: {torch.cuda.memory_allocated(0)/1e9:.2f} GB")
-        logging.info(f"Memory Cached: {torch.cuda.memory_reserved(0)/1e9:.2f} GB")
-    else:
-        logging.info("\nRunning on CPU")
-    
-    logging.info("-" * 80 + "\n")
-
-
-def early_stopping_check(val_metrics, best_metrics, patience):
-    """Check if training should be stopped early"""
-    if val_metrics['f1_macro'] > best_metrics['val_f1']:
-        return False
-    return True
 
 def log_fold_results(fold, metrics):
     """Log results for a single fold"""
@@ -211,3 +129,44 @@ def calculate_metrics(predictions, targets):
         'confusion_matrix': confusion_matrix(targets, predictions)
     }
 
+# In utils2.py - Add these helper functions
+def log_class_statistics(y, phase="", detailed=False):
+    """Concise logging of class distribution"""
+    class_dist = Counter(y.numpy()) if torch.is_tensor(y) else Counter(y)
+    total = sum(class_dist.values())
+    
+    logging.info(f"\n{phase} Class Distribution:")
+    for class_idx in sorted(SLEEP_STAGES.keys()):
+        count = class_dist.get(class_idx, 0)
+        pct = (count / total) * 100 if total > 0 else 0
+        logging.info(f"    {SLEEP_STAGES[class_idx]}: {count:5d} ({pct:5.1f}%)")
+    
+    if detailed:
+        return {
+            'distribution': class_dist,
+            'total': total,
+            'ratios': {cls: count/total for cls, count in class_dist.items()}
+        }
+
+def monitor_batch_balance(loader, num_batches=5):
+    """Monitor class balance in a few batches without excessive logging"""
+    batch_distributions = []
+    
+    for i, (_, _, y) in enumerate(loader):
+        if i >= num_batches:
+            break
+        batch_distributions.append(Counter(y.numpy()))
+    
+    # Calculate average distribution
+    avg_dist = Counter()
+    for dist in batch_distributions:
+        avg_dist.update(dist)
+    for k in avg_dist:
+        avg_dist[k] /= len(batch_distributions)
+    
+    logging.info(f"\nAverage batch distribution ({num_batches} batches):")
+    for class_idx in sorted(SLEEP_STAGES.keys()):
+        avg = avg_dist.get(class_idx, 0)
+        logging.info(f"    {SLEEP_STAGES[class_idx]}: {avg:.1f}")
+    
+    return avg_dist
